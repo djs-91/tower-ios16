@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SubscriptionsView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isAddSourcePresented = false
     @State private var isMacMapExpanded = false
@@ -140,7 +140,7 @@ struct SubscriptionsView: View {
                 AddSourceSheet(editingNode: node)
             }
             .subscriptionRefreshReport()
-            .navigationDestination(item: $sourceManagementRoute) { route in
+            .navigationDestination16(item: $sourceManagementRoute) { route in
                 SourceManagementView(initialRoute: route)
             }
             .alert(
@@ -251,7 +251,7 @@ extension View {
 }
 
 private struct SubscriptionRefreshReportHost: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -406,7 +406,7 @@ private enum PendingDeletion {
 }
 
 private struct EditSubscriptionSheet: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let source: SubscriptionSource
     @Binding var nameDraft: SubscriptionNameDraft
@@ -507,7 +507,7 @@ private struct EditSubscriptionSheet: View {
 /// The same four counts as the iPhone card, in the same order, icons and
 /// tints; only the spacing is the Mac's, with room between the columns.
 private struct MacSubscriptionSummary: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let onMetricTap: (SubscriptionOverviewMetric) -> Void
 
     var body: some View {
@@ -550,7 +550,7 @@ private struct MacSubscriptionSummary: View {
 /// where they come from. Each count has its own icon and tint, the same
 /// shape as the Mac summary.
 private struct SubscriptionMetricsRow: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let onMetricTap: (SubscriptionOverviewMetric) -> Void
 
     var body: some View {
@@ -653,7 +653,7 @@ struct SubscriptionCardMetrics: Equatable {
 }
 
 private struct SubscriptionCard: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let source: SubscriptionSource
     let onRefresh: () -> Void
@@ -740,7 +740,6 @@ private struct SubscriptionCard: View {
             // expanded list without making that list part of the menu snapshot.
             .background(Color(uiColor: .secondarySystemGroupedBackground),
                         in: RoundedRectangle(cornerRadius: TowerTheme.cornerRadius, style: .continuous))
-            .geometryGroup()
             .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: TowerTheme.cornerRadius, style: .continuous))
             .contextMenu {
                 Button(action: onEdit) { Label("编辑", systemImage: "pencil") }
@@ -792,9 +791,7 @@ private struct SubscriptionCard: View {
         // A map region's node list can move this whole card by a large amount.
         // Keep text and the progress bar in the same animated
         // coordinate space, instead of independently interpolating their origins.
-        .geometryGroup()
         .clipped()
-        .sensoryFeedback(.selection, trigger: isExpanded)
         .sheet(item: $sharePayload) { payload in
             SharePayloadSheet(payload: payload)
         }
@@ -985,7 +982,6 @@ private struct LocalNodeCard: View {
                           onDelete: onDelete)
             .padding(5)
             .towerCard()
-            .geometryGroup()
             .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: TowerTheme.cornerRadius, style: .continuous))
             .contextMenu {
                 Button(action: onEdit) { Label("编辑", systemImage: "pencil") }

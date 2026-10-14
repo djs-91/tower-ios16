@@ -911,7 +911,7 @@ final class SubscriptionInteractionTests: XCTestCase {
         let subscriptionsSource = try String(contentsOf: subscriptionsURL, encoding: .utf8)
         let managementSource = try String(contentsOf: managementURL, encoding: .utf8)
 
-        XCTAssertTrue(subscriptionsSource.contains("navigationDestination(item: $sourceManagementRoute)"))
+        XCTAssertTrue(subscriptionsSource.contains("navigationDestination16(item: $sourceManagementRoute)"))
         XCTAssertFalse(subscriptionsSource.contains("navigationDestination(item: $nodeFilterRoute)"))
         XCTAssertFalse(subscriptionsSource.contains("proxy.scrollTo(metric.scrollTarget"))
         XCTAssertTrue(managementSource.contains("case .nodes, .regions: .exportFilter"))

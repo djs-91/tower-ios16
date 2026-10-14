@@ -1,5 +1,12 @@
 <div align="center">
 
+> **⚠️ 这是非官方移植版** — 上游项目 [pengchujin/tower](https://github.com/pengchujin/tower) 官方要求 iOS 17+。
+> 本 fork 将 **v1.0.29 (68)** 移植到 **iOS 16.0+**，供 iOS 16.x 设备侧载自用。
+> 改动仅为 API 降级，不含产品逻辑修改。完整说明见 [BUILD_IOS16.md](BUILD_IOS16.md)。
+
+</div>
+<div align="center">
+
 <img src="docs/images/icon.png" width="128" alt="塔台图标">
 
 # 塔台 · Tower

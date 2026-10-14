@@ -59,7 +59,7 @@ final class MotionDesignTests: XCTestCase {
         let cardSource = String(source[cardStart.lowerBound..<cardEnd.lowerBound])
 
         XCTAssertTrue(
-            cardSource.contains(".geometryGroup()"),
+            cardSource.contains(".geometryGroup16()"),
             "地图节点收起时，订阅卡片背景与流量信息必须作为同一几何单元移动"
         )
     }

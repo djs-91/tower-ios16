@@ -1,0 +1,163 @@
+# Tower iOS 16 IPA 自动构建
+#
+# 用法：在仓库 Actions 标签页点 "Run workflow"（或让我用 API 触发）。
+# 产出：运行结束后 Artifacts 里的 tower-ios16 → Tower-iOS16.ipa
+# 另外：每次运行的编译日志会提交到 buildlog 分支（即使失败也能看到原因）。
+
+name: Build Tower IPA (iOS 16)
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Build configuration
+        type: choice
+        options: [Release, Debug]
+        default: Release
+      scheme:
+        description: Xcode scheme
+        type: string
+        default: Tower
+
+permissions:
+  contents: write   # 允许把日志推到 buildlog 分支
+
+jobs:
+  build:
+    # objectVersion = 77 in project.pbxproj requires Xcode 16+ (PBXFileSystemSynchronizedRootGroup).
+    # macos-14's default Xcode is 15.x and cannot parse it, so use macos-15 and pick Xcode 16 explicitly.
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Environment
+        run: |
+          sw_vers
+          echo "--- installed Xcodes ---"
+          ls -1 /Applications | grep -i '^Xcode' || true
+          echo "--- objectVersion in project ---"
+          grep -m1 objectVersion Tower.xcodeproj/project.pbxproj || true
+
+      - name: Select Xcode 16
+        run: |
+          set -euo pipefail
+          PICKED=""
+          for v in 16.4 16.3 16.2 16.1 16.0; do
+            if [ -d "/Applications/Xcode_${v}.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_${v}.app"
+              PICKED="/Applications/Xcode_${v}.app"
+              break
+            fi
+          done
+          if [ -z "$PICKED" ]; then
+            CAND=$(ls -1d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+            [ -n "$CAND" ] && sudo xcode-select -s "$CAND" && PICKED="$CAND"
+          fi
+          echo "picked: $PICKED"
+          xcodebuild -version
+          echo "XCODE_SELECT=$(xcode-select -p)" >> "$GITHUB_ENV"
+
+      - name: List schemes
+        run: xcodebuild -list -project Tower.xcodeproj
+
+      - name: Verify deployment target
+        run: |
+          N=$(grep -c 'IPHONEOS_DEPLOYMENT_TARGET = 16.0' Tower.xcodeproj/project.pbxproj || true)
+          echo "IPHONEOS_DEPLOYMENT_TARGET = 16.0  occurrences: $N"
+          test "$N" -ge 6 || { echo "::error::deployment target 不是 16.0"; exit 1; }
+
+      - name: Archive
+        id: archive
+        env:
+          CONFIG: ${{ github.event.inputs.configuration || 'Release' }}
+          SCHEME: ${{ github.event.inputs.scheme || 'Tower' }}
+        run: |
+          set -o pipefail
+          mkdir -p build
+          set +e
+          xcodebuild \
+            -project Tower.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIG" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "build/$SCHEME.xcarchive" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            SKIP_INSTALL=NO \
+            archive 2>&1 | tee build/xcodebuild.log
+          RC=${PIPESTATUS[0]}
+          set -e
+          echo "xcodebuild exit=$RC" | tee -a build/xcodebuild.log
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          exit 0    # 永远让后面的诊断步骤跑完
+
+      - name: Diagnose (show the actual errors)
+        if: always()
+        run: |
+          {
+            echo "### xcodebuild exit: ${{ steps.archive.outputs.rc }}"
+            echo ""
+            echo '```'
+            grep -E "error:|fatal error|BUILD FAILED|Command .* failed|warning: .*deprecat" \
+              build/xcodebuild.log 2>/dev/null | sort -u | head -80 || echo "(no log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 同时写到仓库里，方便 API 读取
+          {
+            echo "exit=${{ steps.archive.outputs.rc }}"
+            echo "commit=$(git rev-parse HEAD)"
+            echo "date=$(date -u +%FT%TZ)"
+            echo
+            grep -E "error:|fatal error|BUILD FAILED|Command .* failed" \
+              build/xcodebuild.log 2>/dev/null | sort -u | head -120
+          } > build-log.txt || true
+
+      - name: Publish IPA artifact
+        if: steps.archive.outputs.rc == '0'
+        run: |
+          set -euo pipefail
+          APP=$(find build -maxdepth 4 -name "Tower.app" -type d | head -1)
+          test -n "$APP" || { echo "::error::没找到 Tower.app"; exit 1; }
+          echo "app: $APP"
+          STAGE="build/ipa"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/Payload"
+          cp -R "$APP" "$STAGE/Payload/Tower.app"
+          rm -rf "$STAGE/Payload/Tower.app/_CodeSignature" || true
+          ( cd "$STAGE" && zip -qry "../Tower-iOS16.ipa" Payload )
+          ls -la build/Tower-iOS16.ipa
+          echo "IPA_SIZE=$(stat -f%z build/Tower-iOS16.ipa)" >> "$GITHUB_ENV"
+
+      - name: Upload IPA
+        if: steps.archive.outputs.rc == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tower-ios16
+          path: build/Tower-iOS16.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Push build log to buildlog branch (always)
+        if: always()
+        run: |
+          set +e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p logs && cp -f build/xcodebuild.log logs/xcodebuild.log 2>/dev/null
+          {
+            echo "exit=${{ steps.archive.outputs.rc }}"
+            echo "date=$(date -u +%FT%TZ)"
+            echo "xcode=$(xcodebuild -version 2>&1 | head -1)"
+            echo
+            grep -E "error:|fatal error|BUILD FAILED|Command .* failed" \
+              build/xcodebuild.log 2>/dev/null | sort -u | head -120
+          } > build-log.txt
+          git checkout --orphan buildlog 2>/dev/null
+          git add -f build-log.txt logs/xcodebuild.log 2>/dev/null
+          git commit -q -m "build log: exit=${{ steps.archive.outputs.rc }}"
+          git push -f origin buildlog 2>&1 | tail -3
+          echo "pushed to buildlog branch"

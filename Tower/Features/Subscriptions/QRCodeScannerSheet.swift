@@ -24,9 +24,9 @@ struct QRCodeScannerSheet: View {
 struct QRCodeScannerPreview: View {
     let onScan: (String) -> Void
     var body: some View {
-        ContentUnavailableView {
+        TowerContentUnavailableView {
             Label("无法使用相机扫码", systemImage: "camera.fill")
-        } description: {
+        } detail: {
             Text("请检查相机权限，或切换到粘贴识别。")
         }
     }
@@ -49,9 +49,9 @@ struct QRCodeScannerPreview: View {
                     .id(generation)
                     .frame(minHeight: 250)
             } else {
-                ContentUnavailableView {
+                TowerContentUnavailableView {
                     Label("无法使用相机扫码", systemImage: "camera.fill")
-                } description: {
+                } detail: {
                     Text(failure ?? String(localized: "请检查相机权限，或切换到粘贴识别。"))
                 } actions: {
                     Button("重试") { retry() }
@@ -74,7 +74,7 @@ struct QRCodeScannerPreview: View {
             retry()
             isRequestingPermission = false
         }
-        .onChange(of: scenePhase) { _, phase in if phase == .active { retry() } }
+        .onChange(of: scenePhase) { phase in if phase == .active { retry() } }
     }
 
     private func retry() {

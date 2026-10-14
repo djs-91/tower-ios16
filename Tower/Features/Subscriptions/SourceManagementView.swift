@@ -2,7 +2,7 @@ import SwiftUI
 
 struct SourceManagementView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     private let initialRoute: SourceManagementRoute
     @State private var tab: SourceManagementTab
     @State private var showsEntryTitle = true
@@ -82,14 +82,14 @@ struct SourceManagementView: View {
         } message: { deletion in
             Text(deletion.message)
         }
-        .onChange(of: tab) { _, _ in
+        .onChange(of: tab) { _ in
             searchText = ""
             showsEntryTitle = false
         }
-        .onChange(of: model.subscriptions.map(\.id)) { _, sourceIDs in
+        .onChange(of: model.subscriptions.map(\.id)) { sourceIDs in
             selectedSubscriptionIDs.formIntersection(sourceIDs)
         }
-        .onChange(of: model.localNodes.map(\.id)) { _, nodeIDs in
+        .onChange(of: model.localNodes.map(\.id)) { nodeIDs in
             selectedLocalNodeIDs.formIntersection(nodeIDs)
         }
         .subscriptionRefreshReport()
@@ -211,9 +211,7 @@ struct SourceManagementView: View {
                 HStack {
                     Text("已选择 \(selectedItemCount) 项")
                         .font(.subheadline.weight(.semibold))
-                        .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                            content.contentTransition(reduceMotion ? .opacity : .numericText(value: Double(selectedItemCount)))
-                        }
+                        .contentTransition(.opacity).animation(TowerMotion.selection(reduceMotion: reduceMotion), value: Double(selectedItemCount))
 
                     Spacer()
 
@@ -277,7 +275,7 @@ struct SourceManagementView: View {
     }
 
     private func managementEmptyState(title: LocalizedStringKey, symbol: String) -> some View {
-        ContentUnavailableView(title, systemImage: symbol)
+        TowerContentUnavailableView(title, systemImage: symbol)
             .listRowBackground(Color.clear)
     }
 
@@ -448,7 +446,7 @@ struct SourceManagementView: View {
 /// Owns its progress state so starting and finishing a refresh invalidates only
 /// the toolbar control, not the management list and its thousand-node filters.
 private struct SubscriptionRefreshToolbarButton: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     private var isRefreshing: Bool { model.subscriptionRefreshProgress != nil }
     let sources: [SubscriptionSource]
 

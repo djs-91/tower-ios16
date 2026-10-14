@@ -22,7 +22,7 @@ struct ImportRuleSchemeSheet: View {
     }
     private enum Field { case url, text }
 
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var source: Source = .link
@@ -45,6 +45,58 @@ struct ImportRuleSchemeSheet: View {
         return input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var sourcePicker: some View {
+        HStack(spacing: 4) {
+            ForEach(Source.allCases) { mode in
+                Button { source = mode } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: mode.symbol)
+                        Text(mode.title)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(source == mode ? Color.accentColor : Color.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .background {
+                        if source == mode {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                                .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
+                        }
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .accessibilityAddTraits(source == mode ? .isSelected : [])
+                .accessibilityIdentifier("scheme-import-source-\(mode.rawValue)")
+            }
+        }
+        .padding(4)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+        .listRowBackground(Color.clear)
+    }
+
+    private var importSheetCancelItem: some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            Button("取消") {
+                if isSaving { cancel() }
+                else { requestsDiscard = true }
+            }
+        }
+    }
+
+    private var importSheetConfirmItem: some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button(isSaving ? "正在导入…" : "导入") {
+                saveTask = Task { await save() }
+            }
+            .disabled(inputIsEmpty || isSaving)
+            .accessibilityIdentifier("save-scheme")
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -52,36 +104,7 @@ struct ImportRuleSchemeSheet: View {
                 // quiet track and a raised segment, not three tiles where the
                 // selected one is a solid accent block.
                 Section {
-                    HStack(spacing: 4) {
-                        ForEach(Source.allCases) { mode in
-                            Button { source = mode } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: mode.symbol)
-                                    Text(mode.title)
-                                        .lineLimit(1)
-                                        .minimumScaleFactor(0.75)
-                                }
-                                .font(.subheadline.weight(.semibold))
-                                .foregroundStyle(source == mode ? Color.accentColor : Color.secondary)
-                                .frame(maxWidth: .infinity, minHeight: 40)
-                                .background {
-                                    if source == mode {
-                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                            .fill(Color(uiColor: .secondarySystemGroupedBackground))
-                                            .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
-                                    }
-                                }
-                                .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                            }
-                            .buttonStyle(ResponsivePressButtonStyle())
-                            .accessibilityAddTraits(source == mode ? .isSelected : [])
-                            .accessibilityIdentifier("scheme-import-source-\(mode.rawValue)")
-                        }
-                    }
-                    .padding(4)
-                    .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
-                    .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
-                    .listRowBackground(Color.clear)
+                    sourcePicker
                 }
                 if source == .link {
                     Section {
@@ -148,21 +171,9 @@ struct ImportRuleSchemeSheet: View {
                 isBusy: isSaving, requested: $requestsDiscard) { cancel() }
             .onDisappear { cancel() }
             .scrollDismissesKeyboard(.interactively)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") {
-                        if isSaving { cancel() }
-                        else { requestsDiscard = true }
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(isSaving ? "正在导入…" : "导入") {
-                        saveTask = Task { await save() }
-                    }
-                    .disabled(inputIsEmpty || isSaving)
-                    .accessibilityIdentifier("save-scheme")
-                }
-
+            .toolbar16 {
+                importSheetCancelItem
+                importSheetConfirmItem
             }
             .fileImporter(isPresented: $showsFilePicker, allowedContentTypes: [.data]) { result in
                 switch result {
@@ -173,12 +184,12 @@ struct ImportRuleSchemeSheet: View {
                 }
             }
             .onAppear { focusedField = .url }
-            .onChange(of: source) { _, value in
+            .onChange(of: source) { value in
                 clearImportError()
                 focusedField = value == .link ? .url : value == .text ? .text : nil
             }
-            .onChange(of: urlString) { clearImportError() }
-            .onChange(of: configurationText) { clearImportError() }
+            .onChange(of: urlString) { _ in clearImportError() }
+            .onChange(of: configurationText) { _ in clearImportError() }
         }
         .disabled(showsTaskOverlay)
         .accessibilityHidden(showsTaskOverlay)

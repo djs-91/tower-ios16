@@ -781,49 +781,49 @@ struct ProxyNode: Identifiable, Codable, Hashable {
         // distinct nodes when their display name, SNI, transport or other
         // connection parameters differ. Use the complete parsed identity so
         // only an exact repeated node is collapsed.
-        var fields = [kind.rawValue, name, server.lowercased(), String(port)]
-        fields.append(contentsOf: [cipher ?? "", password ?? "", uuid ?? "", username ?? ""])
+        var fields: [String] = [kind.rawValue, name, server.lowercased(), String(port)]
+        fields.append(contentsOf: [cipher ?? "", password ?? "", uuid ?? "", username ?? ""] as [String])
         fields.append(contentsOf: [
             transport ?? "", transportMode ?? "", plugin ?? "", pluginMux.map { $0 ? "1" : "0" } ?? "", tls ? "1" : "0",
             sni ?? "", hostHeader ?? "", path ?? "", alpn ?? ""
-        ])
+        ] as [String])
         fields.append(contentsOf: [
             realityPublicKey ?? "", realityShortID ?? "", fingerprint ?? "", flow ?? "",
             skipCertificateVerification ? "1" : "0"
-        ])
+        ] as [String])
         fields.append(contentsOf: [
             alterID.map(String.init) ?? "", protocolName ?? "", protocolParam ?? "",
             obfs ?? "", obfsParam ?? ""
-        ])
+        ] as [String])
         let idleCheck = idleSessionCheckInterval.map { String($0) } ?? ""
         let idleTimeout = idleSessionTimeout.map { String($0) } ?? ""
         let minimumIdle = minIdleSession.map { String($0) } ?? ""
         let protocolVersion = version.map { String($0) } ?? ""
-        fields.append(contentsOf: [certificateFingerprint ?? "", idleCheck, idleTimeout, minimumIdle, protocolVersion])
+        fields.append(contentsOf: [certificateFingerprint ?? "", idleCheck, idleTimeout, minimumIdle, protocolVersion] as [String])
         fields.append(contentsOf: [
             congestionControl ?? "", udpRelayMode ?? "", portHopping ?? "",
             udpRelayEnabled.map { $0 ? "1" : "0" } ?? "",
             upMbps.map(String.init) ?? "", downMbps.map(String.init) ?? ""
-        ])
+        ] as [String])
         fields.append(contentsOf: [
             wireGuardPrivateKey ?? "", wireGuardPublicKey ?? "", wireGuardPreSharedKey ?? "",
             wireGuardIPv4 ?? "", wireGuardIPv6 ?? "", wireGuardAllowedIPs ?? "",
             wireGuardReserved ?? "", wireGuardMTU.map(String.init) ?? "",
             wireGuardPersistentKeepalive.map(String.init) ?? "", wireGuardDNS ?? ""
-        ])
+        ] as [String])
         if let shadowTLS {
             // Append only for wrapped nodes: existing persisted exclusion keys
             // for ordinary nodes must not change when adding this feature.
             fields.append(contentsOf: ["shadow-tls", String(shadowTLS.version), shadowTLS.host,
-                                      shadowTLS.password, String(shadowTLS.skipCertificateVerification)])
+                                      shadowTLS.password, String(shadowTLS.skipCertificateVerification)] as [String])
         }
         if let masque { fields.append(masque.identity) }
-        if let vlessEncryption { fields.append(contentsOf: ["vless-encryption", vlessEncryption]) }
+        if let vlessEncryption { fields.append(contentsOf: ["vless-encryption", vlessEncryption] as [String]) }
         if let ssh {
             fields.append(contentsOf: ["ssh", ssh.privateKey ?? "", ssh.privateKeyPassphrase ?? "",
-                                      ssh.hostKeys.joined(separator: "\n"), ssh.hostKeyAlgorithms.joined(separator: ",")])
+                                      ssh.hostKeys.joined(separator: "\n"), ssh.hostKeyAlgorithms.joined(separator: ",")] as [String])
         }
-        if let trustTunnel { fields.append(contentsOf: ["trusttunnel", trustTunnel.quic ? "quic" : "h2"]) }
+        if let trustTunnel { fields.append(contentsOf: ["trusttunnel", trustTunnel.quic ? "quic" : "h2"] as [String]) }
         return fields.joined(separator: "\u{1F}")
     }
 

@@ -5,14 +5,14 @@ struct TowerApp: App {
     // Coalesced rather than immediate: a burst of edits — ticking through the
     // node filter, reordering policy groups — becomes one write shortly after
     // the user stops, instead of a full snapshot encode inside every tap.
-    @State private var model = AppModel(persistencePolicy: .coalesced(.milliseconds(250)))
+    @StateObject private var model = AppModel(persistencePolicy: .coalesced(.milliseconds(250)))
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("hasSeenWelcome") private var hasSeenWelcome = false
 
     var body: some Scene {
         WindowGroup {
             AppRootView()
-                .environment(model)
+                .environmentObject(model)
                 .onAppear {
                     #if targetEnvironment(macCatalyst)
                     for scene in UIApplication.shared.connectedScenes {
@@ -37,7 +37,7 @@ struct TowerApp: App {
                     guard hasSeenWelcome else { return }
                     await model.performForegroundOpenWork()
                 }
-                .onChange(of: scenePhase) { _, phase in
+                .onChange(of: scenePhase) { phase in
                     guard phase == .active else {
                         if phase == .background { model.didEnterBackground() }
                         // Leaving the foreground is the last reliable moment to
@@ -70,7 +70,7 @@ struct TowerApp: App {
 }
 
 struct AppRootView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     /// Whether the privacy introduction has been shown. Stored rather than
     /// derived so a user who already trusts the app never sees it twice, and
@@ -99,8 +99,6 @@ struct AppRootView: View {
     }
 
     private var mainInterface: some View {
-        @Bindable var model = model
-
         return TabView(selection: $model.tabSelection) {
             NavigationStack {
                 SubscriptionsView()
@@ -132,7 +130,7 @@ struct AppRootView: View {
 /// Keep the desktop welcome surface's transition independent of the settings
 /// sheet being dismissed by its trigger.
 private struct MacOnboardingOverlay: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isPresented = false
 
@@ -157,7 +155,12 @@ private struct MacOnboardingOverlay: View {
             }
         }
         .allowsHitTesting(isPresented)
-        .onChange(of: model.isReplayingMacOnboarding, initial: true) { _, value in
+        .onAppear {
+            withTransaction(Transaction(animation: TowerMotion.surface(reduceMotion: reduceMotion))) {
+                isPresented = model.isReplayingMacOnboarding
+            }
+        }
+        .onChange(of: model.isReplayingMacOnboarding) { value in
             withTransaction(Transaction(animation: TowerMotion.surface(reduceMotion: reduceMotion))) {
                 isPresented = value
             }
@@ -168,7 +171,7 @@ private struct MacOnboardingOverlay: View {
 /// Keep the haptic trigger's observation out of the complete tab hierarchy.
 /// The feedback dependency no longer invalidates the root on each selection.
 private struct TabSelectionFeedback: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     // Development-only A/B control for device haptics profiling. Default UI
     // behavior is unchanged; a simulator cannot measure Taptic Engine cost.
     private var tabHapticsEnabled: Bool {
@@ -181,7 +184,6 @@ private struct TabSelectionFeedback: View {
 
     var body: some View {
         Color.clear.frame(width: 0, height: 0)
-            .sensoryFeedback(.selection, trigger: model.selectedTab) { _, _ in tabHapticsEnabled }
             .allowsHitTesting(false)
             .accessibilityHidden(true)
     }
@@ -201,7 +203,7 @@ extension View {
 }
 
 private struct ToastOverlay: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var showsRefreshProgress = false
     @State private var presentedToast: ToastMessage?
@@ -258,7 +260,7 @@ private struct ToastOverlay: View {
             presentedToast = model.toast
             presentedRefresh = refreshStatus
         }
-        .onChange(of: model.toast) { _, toast in
+        .onChange(of: model.toast) { toast in
             withAnimation(appearance) {
                 if let toast, let previous = presentedToast, previous.id != toast.id {
                     surfaceID = UUID()
@@ -266,7 +268,7 @@ private struct ToastOverlay: View {
                 presentedToast = toast
             }
         }
-        .onChange(of: refreshStatus) { _, status in
+        .onChange(of: refreshStatus) { status in
             // Only appearing and leaving move the surface; a count ticking up
             // is a small in-place change.
             let visibilityChanged = (presentedRefresh == nil) != (status == nil)
@@ -317,7 +319,7 @@ private struct SubscriptionRefreshStatusContent: View {
             Text("正在刷新订阅（\(completed)/\(total)）")
                 .font(.subheadline.weight(.semibold))
                 .monospacedDigit()
-                .contentTransition(.numericText(value: Double(completed)))
+                .contentTransition(.opacity)
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
 

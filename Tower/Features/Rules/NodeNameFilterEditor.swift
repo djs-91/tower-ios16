@@ -2,7 +2,7 @@ import SwiftUI
 
 /// Creation shares the candidate editor's navigation stack, including on Mac.
 struct CustomNodeFilterCreator: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     let scheme: RuleScheme
     let onCreated: (String) -> Void
@@ -191,13 +191,13 @@ struct NodeNameFilterFields: View {
         .padding(.vertical, 4)
         // Keep synchronization on the visible field container, never a separate
         // lazy list row that might not exist when the user taps Save.
-        .onChange(of: keywords) { _, values in
+        .onChange(of: keywords) { values in
             draft.keywords = values.map(\.value).joined(separator: "\n")
         }
-        .onChange(of: draft) { _, value in
+        .onChange(of: draft) { value in
             pattern = value == initialDraft ? originalPattern : value.pattern
         }
-        .onChange(of: draft.style) { _, _ in
+        .onChange(of: draft.style) { _ in
             focusedKeyword = nil
         }
     }
@@ -391,9 +391,7 @@ struct NodeNameFilterPreview: View {
                         }
                     }
                 }
-                .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                    content.opacity(isCurrent ? 1 : 0.45)
-                }
+                .opacity(isCurrent ? 1 : 0.45).animation(TowerMotion.selection(reduceMotion: reduceMotion), value: isCurrent)
                 .accessibilityHidden(!isCurrent)
             } else {
                 ProgressView("正在匹配…")
