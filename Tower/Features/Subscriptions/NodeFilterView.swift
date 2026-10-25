@@ -96,8 +96,7 @@ final class NodeExportGroupCache {
 
 struct NodeFilterSections: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(AppModel.self) private var model
-
+    @EnvironmentObject private var model: AppModel
     @Binding var searchText: String
     @Binding var showsNameFilter: Bool
     /// Country and protocol groups only change with the nodes or their
@@ -152,7 +151,7 @@ struct NodeFilterSections: View {
 
             Section {
                 if filteredNodes.isEmpty {
-                    ContentUnavailableView.search(text: searchText)
+                    TowerContentUnavailableView.search(text: searchText)
                         .listRowBackground(Color.clear)
                 } else {
                     ForEach(filteredNodes) { node in
@@ -164,9 +163,7 @@ struct NodeFilterSections: View {
                     Text("节点 · \(includedFilteredNodeCount) / \(filteredNodes.count)")
                         // Scope motion to glyphs; a header transaction must not
                         // animate the List's row diff when search is dismissed.
-                        .animation(TowerMotion.selection(reduceMotion: reduceMotion)) { content in
-                            content.contentTransition(reduceMotion ? .opacity : .numericText(value: Double(includedFilteredNodeCount)))
-                        }
+                        .contentTransition(.opacity).animation(TowerMotion.selection(reduceMotion: reduceMotion), value: Double(includedFilteredNodeCount))
                     Spacer()
                     bulkSelectionButton(
                         filteredNodes: eligibleFilteredNodes,
@@ -273,7 +270,6 @@ struct NodeFilterSections: View {
             }
             Divider()
             Button("完成") {}
-                .menuActionDismissBehavior(.enabled)
         } label: {
             FilterRow(
                 title: String(localized: "国家地区"),
@@ -284,7 +280,6 @@ struct NodeFilterSections: View {
         }
         // Region selection is a multi-select task: keep the native menu open
         // for toggles, and dismiss only via Done or a tap outside the menu.
-        .menuActionDismissBehavior(.disabled)
         // A List tints a menu's label like a link; this row reads as a setting.
         .buttonStyle(.plain)
         .listRowInsets(FilterRow.insets)
@@ -307,7 +302,6 @@ struct NodeFilterSections: View {
             }
             Divider()
             Button("完成") {}
-                .menuActionDismissBehavior(.enabled)
         } label: {
             FilterRow(
                 title: String(localized: "协议"),
@@ -317,7 +311,6 @@ struct NodeFilterSections: View {
             )
         }
         // Keep the protocol menu open while selecting multiple kinds.
-        .menuActionDismissBehavior(.disabled)
         // A List tints a menu's label like a link; this row reads as a setting.
         .buttonStyle(.plain)
         .listRowInsets(FilterRow.insets)
@@ -410,7 +403,7 @@ struct NodeFilterSections: View {
 /// The same editor used by policy-group name rules, with a separate saved
 /// condition that controls which nodes reach every export destination.
 struct NodeExportNameFilterSheet: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var pattern: String
     @State private var previewResult: NodeNameFilterPreviewResult?

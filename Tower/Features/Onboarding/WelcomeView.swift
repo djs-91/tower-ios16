@@ -35,7 +35,7 @@ struct WelcomeView: View {
 
                     }
                 }
-                .tabViewStyle(.page(indexDisplayMode: .never))
+                .tabViewStyle(PageTabViewStyle(indexDisplayMode: .never))
                 .contentShape(Rectangle())
                 .simultaneousGesture(DragGesture(minimumDistance: 20)
                     .onChanged { _ in
@@ -59,7 +59,6 @@ struct WelcomeView: View {
         .frame(maxHeight: TowerPlatform.isMac ? 760 : .infinity)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(TowerTheme.background.ignoresSafeArea())
-        .sensoryFeedback(.selection, trigger: page)
     }
 
     private var journey: some View {
@@ -77,7 +76,7 @@ struct WelcomeView: View {
     private func journeyItem(_ title: LocalizedStringKey, symbol: String, step: Int) -> some View {
         HStack(spacing: 5) {
             Image(systemName: page > step ? "checkmark" : symbol)
-                .contentTransition(.symbolEffect(.replace))
+                .contentTransition(.opacity)
             Text(title).lineLimit(1).minimumScaleFactor(0.7)
         }
         .font(.caption.weight(.semibold))
@@ -165,7 +164,7 @@ struct WelcomeView: View {
         let destination = min(3, max(0, target))
         guard destination != page else { return }
         withAnimation(reduceMotion ? .easeOut(duration: TowerMotion.reducedMotionDuration)
-                      : .spring(duration: 0.5, bounce: 0.2)) {
+                      : .spring(response: 0.5, dampingFraction: 0.8)) {
             page = destination
         }
     }
@@ -262,7 +261,6 @@ private struct WelcomePageContent: View {
             }
             .padding(.horizontal, 26).padding(.bottom, 24)
         }
-        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var introductionHeading: some View {
@@ -331,7 +329,7 @@ private struct WelcomeSceneLoop<Phase: Equatable, Content: View>: View {
         if reduceMotion {
             content(finished)
         } else if isActive {
-            PhaseAnimator(phases, content: content, animation: animation)
+            PhaseDriver(phases: phases, interval: .milliseconds(900), content: content)
         } else {
             content(phases[0])
         }
@@ -431,10 +429,10 @@ private enum OverviewPhase {
     /// the delays: PhaseAnimator only moves on once the previous step lands.
     func animation(index: Int = 0) -> Animation {
         switch self {
-        case .gather: .spring(duration: 0.7, bounce: 0).delay(0.8 + Double(index) * 0.08)
-        case .process: .spring(duration: 0.45, bounce: 0.3)
-        case .deliver: .spring(duration: 0.75, bounce: 0).delay(0.15 + Double(index) * 0.09)
-        case .done: .spring(duration: 0.4, bounce: 0.35).delay(Double(index) * 0.09)
+        case .gather: .spring(response: 0.7, dampingFraction: 1.0).delay(0.8 + Double(index) * 0.08)
+        case .process: .spring(response: 0.45, dampingFraction: 0.7)
+        case .deliver: .spring(response: 0.75, dampingFraction: 1.0).delay(0.15 + Double(index) * 0.09)
+        case .done: .spring(response: 0.4, dampingFraction: 0.65).delay(Double(index) * 0.09)
         case .idle: .easeOut(duration: 0.35).delay(1.8)
         case .summary: .default
         }
@@ -607,10 +605,10 @@ private enum AddPhase: CaseIterable {
         case .press: .easeOut(duration: 0.2).delay(0.7)
         // Linear, because the link reads as text arriving left to right.
         case .pasted: .linear(duration: 0.5).delay(0.1)
-        case .recognized: .spring(duration: 0.4, bounce: 0.2).delay(0.25)
-        case .nodes: .spring(duration: 0.5, bounce: 0.15).delay(0.35 + Double(index) * 0.08)
+        case .recognized: .spring(response: 0.4, dampingFraction: 0.8).delay(0.25)
+        case .nodes: .spring(response: 0.5, dampingFraction: 0.85).delay(0.35 + Double(index) * 0.08)
         case .measured: .easeOut(duration: 0.25).delay(0.6 + Double(index) * 0.15)
-        case .chosen: .spring(duration: 0.35, bounce: 0.3).delay(0.8)
+        case .chosen: .spring(response: 0.35, dampingFraction: 0.7).delay(0.8)
         case .empty: .easeOut(duration: 0.3).delay(2)
         }
     }
@@ -861,9 +859,9 @@ private struct WelcomeRoutingScene: View {
         if phase == 0 { return .easeOut(duration: 0.3).delay(1.8) }
         if phase.isMultiple(of: 2) {
             // A pause at the scheme first, long enough to read the rule.
-            return .spring(duration: 0.55, bounce: 0.1).delay(0.65)
+            return .spring(response: 0.55, dampingFraction: 0.9).delay(0.65)
         }
-        return .spring(duration: 0.5, bounce: 0).delay(phase == 1 ? 0.6 : 0.15)
+        return .spring(response: 0.5, dampingFraction: 1.0).delay(phase == 1 ? 0.6 : 0.15)
     }
 
     private var accessibilitySummary: String {
@@ -1010,7 +1008,7 @@ private struct RoutingDiagram: View {
             Text(verbatim: lane.title).font(.caption.weight(.semibold))
             Text(verbatim: "\(count)")
                 .font(.caption2.weight(.bold).monospacedDigit())
-                .contentTransition(.numericText(value: Double(count)))
+                .contentTransition(.opacity)
                 .foregroundStyle(.white)
                 .frame(minWidth: 16, minHeight: 16)
                 .background(lane.tint, in: Circle())
@@ -1037,6 +1035,8 @@ private struct WelcomeExportExample: View {
     /// at the tile that was tapped rather than above the button.
     @State private var tileIconFrames: [String: CGRect] = [:]
     @State private var receiverFrame: CGRect = .zero
+    /// Sweep progress for the icon flight; 1 means it has landed.
+    @State private var flightProgress: CGFloat = 1
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     private var clients: [ClientTarget] {
@@ -1086,15 +1086,15 @@ private struct WelcomeExportExample: View {
                         VStack(spacing: 7) {
                             SceneClientIcon(client: target, size: 44)
                                 .scaleEffect(client == target || reduceMotion ? 1 : 0.92)
-                                .onGeometryChange(for: CGRect.self) {
+.onGeometryChange16(for: CGRect.self, transform: {
                                     $0.frame(in: .named(Self.space))
-                                } action: { tileIconFrames[target.id] = $0 }
+                                }, action: { tileIconFrames[target.id] = $0 })
                             Text(verbatim: target.name).font(.caption.weight(.semibold))
                                 .lineLimit(1).minimumScaleFactor(0.7)
                                 .foregroundStyle(.primary)
                             Image(systemName: client == target ? "checkmark.circle.fill" : "circle")
                                 .foregroundStyle(client == target ? Color.accentColor : Color.secondary.opacity(0.5))
-                                .contentTransition(.symbolEffect(.replace))
+                                .contentTransition(.opacity)
                         }
                         .padding(.vertical, 6).frame(maxWidth: .infinity, minHeight: 84)
                         .contentShape(Rectangle())
@@ -1133,16 +1133,28 @@ private struct WelcomeExportExample: View {
             }
             .padding(18).towerCard()
         }
-        .coordinateSpace(.named(Self.space))
+        .coordinateSpace(name: Self.space)
         .overlay { flight }
-        .sensoryFeedback(.selection, trigger: client)
-        .onChange(of: client) { deliveries += 1 }
+        .onChange(of: client) { _ in startFlight() }
         .task(id: isActive) {
             // Hand the first configuration over once the page has settled.
             guard isActive else { return }
             try? await Task.sleep(for: .milliseconds(450))
             guard !Task.isCancelled else { return }
-            deliveries += 1
+            startFlight()
+        }
+    }
+
+    /// Restarts the flight sweep; the deliveries counter still drives the
+    /// receiver's landing spring.
+    private func startFlight() {
+        deliveries += 1
+        guard !reduceMotion else { return }
+        flightProgress = 0
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.flightDuration))
+            guard !Task.isCancelled else { return }
+            flightProgress = 1
         }
     }
 
@@ -1155,9 +1167,9 @@ private struct WelcomeExportExample: View {
     /// after its asset, inside the button whose title already names the client.
     private var receivingIcon: some View {
         animatedReceivingIcon
-            .onGeometryChange(for: CGRect.self) {
+.onGeometryChange16(for: CGRect.self, transform: {
                 $0.frame(in: .named(Self.space))
-            } action: { receiverFrame = $0 }
+            }, action: { receiverFrame = $0 })
             .accessibilityHidden(true)
     }
 
@@ -1166,26 +1178,12 @@ private struct WelcomeExportExample: View {
             .scaleEffect(client.appIconFillScale)
             .frame(width: 30, height: 30)
             .clipShape(RoundedRectangle(cornerRadius: 8))
-        if reduceMotion {
-            icon
-        } else {
-            KeyframeAnimator(initialValue: ReceiverFrame(), trigger: deliveries) { frame in
-                icon
-                    .opacity(frame.opacity)
-                    .scaleEffect(frame.scale)
-            } keyframes: { _ in
-                KeyframeTrack(\.opacity) {
-                    LinearKeyframe(0, duration: 0.01)
-                    LinearKeyframe(0, duration: Self.flightDuration - 0.05)
-                    LinearKeyframe(1, duration: 0.04)
-                }
-                KeyframeTrack(\.scale) {
-                    LinearKeyframe(1, duration: Self.flightDuration)
-                    SpringKeyframe(1.16, duration: 0.12, spring: .snappy)
-                    SpringKeyframe(1, duration: 0.35, spring: .bouncy)
-                }
-            }
-        }
+        // iOS 16 has no KeyframeAnimator: the icon takes the landing directly
+        // and the spring plays against the settled value.
+        icon
+            .scaleEffect(deliveries == 0 ? 1 : 1.16)
+            .animation(.spring(response: 0.12, dampingFraction: 0.85), value: deliveries)
+            .animation(.spring(response: 0.35, dampingFraction: 0.7), value: deliveries == 0)
     }
 
     /// A copy of the tapped client's icon arcs from its tile down into the
@@ -1194,39 +1192,31 @@ private struct WelcomeExportExample: View {
     @ViewBuilder private var flight: some View {
         if !reduceMotion, let start = tileIconFrames[client.id], receiverFrame != .zero {
             let end = receiverFrame
-            KeyframeAnimator(initialValue: FlightFrame(), trigger: deliveries) { frame in
-                let t = frame.progress
-                // Lift a little before falling, so the path reads as thrown
-                // from the tile rather than slid across the card.
-                let arc = -sin(.pi * t) * 28
-                SceneClientIcon(client: client, size: start.width)
-                    .scaleEffect(1 + (end.width / start.width - 1) * t)
-                    .position(x: start.midX + (end.midX - start.midX) * t,
-                              y: start.midY + (end.midY - start.midY) * t + arc)
-                    .opacity(frame.opacity)
-            } keyframes: { _ in
-                KeyframeTrack(\.progress) {
-                    LinearKeyframe(0, duration: 0.01)
-                    SpringKeyframe(1, duration: Self.flightDuration, spring: .smooth)
-                }
-                KeyframeTrack(\.opacity) {
-                    LinearKeyframe(1, duration: 0.01)
-                    LinearKeyframe(1, duration: Self.flightDuration - 0.02)
-                    LinearKeyframe(0, duration: 0.01)
-                }
-            }
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
+            // iOS 16 has no KeyframeAnimator: sweep the arc with a timer-driven
+            // progress value instead of an animatable frame.
+            FlightArc(from: start, to: end, client: client, progress: flightProgress)
+                .opacity(flightProgress >= 1 ? 0 : 1)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
         }
     }
 }
 
-private struct ReceiverFrame {
-    var opacity: Double = 1
-    var scale: CGFloat = 1
-}
+/// Draws the client's icon along an arc between its tile and the button.
+private struct FlightArc: View {
+    let from: CGRect
+    let to: CGRect
+    let client: ClientTarget
+    let progress: CGFloat
 
-private struct FlightFrame {
-    var progress: CGFloat = 0
-    var opacity: Double = 0
+    var body: some View {
+        let t = min(max(progress, 0), 1)
+        // Lift a little before falling, so the path reads as thrown
+        // from the tile rather than slid across the card.
+        let arc = -sin(.pi * t) * 28
+        SceneClientIcon(client: client, size: from.width)
+            .scaleEffect(1 + (to.width / from.width - 1) * t)
+            .position(x: from.midX + (to.midX - from.midX) * t,
+                      y: from.midY + (to.midY - from.midY) * t + arc)
+    }
 }

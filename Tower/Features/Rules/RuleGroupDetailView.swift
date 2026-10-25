@@ -39,7 +39,7 @@ enum RulesetPresentation {
 /// it. Changes save as they are made, like Settings, so there is no second
 /// "edit" layer to find.
 struct RuleGroupDetailView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let scheme: RuleScheme
     @State var groupName: String
     let onDelete: (RuleSchemeGroup) -> Void
@@ -102,7 +102,7 @@ struct RuleGroupDetailView: View {
                     .accessibilityIdentifier("rule-group-delete")
                 }
             } else {
-                ContentUnavailableView("策略组已删除", systemImage: "trash")
+                TowerContentUnavailableView("策略组已删除", systemImage: "trash")
                     .listRowBackground(Color.clear)
             }
         }
@@ -115,12 +115,12 @@ struct RuleGroupDetailView: View {
         .navigationTitle(RulePolicyPresentation.nameWithoutLeadingEmoji(groupName))
         .navigationBarTitleDisplayMode(.inline)
         .onAppear { loadDrafts() }
-        .onChange(of: group) { _, _ in loadDrafts() }
-        .onChange(of: selectedReferences) { _, _ in saveRouting() }
-        .onChange(of: selectedKind) { _, _ in
+        .onChange(of: group) { _ in loadDrafts() }
+        .onChange(of: selectedReferences) { _ in saveRouting() }
+        .onChange(of: selectedKind) { _ in
             if isRoutingGroup { saveRouting() } else { saveNodeFilters() }
         }
-        .onChange(of: isEditingName) { _, editing in if !editing { commitName() } }
+        .onChange(of: isEditingName) { editing in if !editing { commitName() } }
         .onDisappear { commitName() }
         .task(id: sources) {
             var counts: [RuleSchemeRuleset: Int] = [:]
@@ -129,7 +129,7 @@ struct RuleGroupDetailView: View {
             }
             lineCounts = counts
         }
-        .navigationDestination(item: $openedSource) { source in
+        .navigationDestination16(item: $openedSource) { source in
             RulesetContentView(ruleset: source)
         }
         .task(id: nodeFilterPreviewInput) {
@@ -503,7 +503,7 @@ enum RuleLineKind: CaseIterable, Hashable {
 }
 
 struct RulesetContentView: View {
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     let ruleset: RuleSchemeRuleset
     @State private var lines: [String]?
     @State private var searchText = ""
@@ -566,10 +566,10 @@ struct RulesetContentView: View {
             }
             if let lines {
                 if ruleset.isBinaryRuleSet {
-                    ContentUnavailableView("无法预览", systemImage: "doc.zipper", description: Text("这是 mihomo 的二进制规则集，只有对应客户端能读取。"))
+                    TowerContentUnavailableView("无法预览", systemImage: "doc.zipper", description: Text("这是 mihomo 的二进制规则集，只有对应客户端能读取。"))
                         .listRowBackground(Color.clear)
                 } else if lines.isEmpty {
-                    ContentUnavailableView("规则列表还没下载到本机", systemImage: "icloud.and.arrow.down", description: Text("回到规则页刷新这个方案后即可查看。"))
+                    TowerContentUnavailableView("规则列表还没下载到本机", systemImage: "icloud.and.arrow.down", description: Text("回到规则页刷新这个方案后即可查看。"))
                         .listRowBackground(Color.clear)
                 } else {
                     Section {
@@ -578,7 +578,7 @@ struct RulesetContentView: View {
                             .listRowBackground(Color.clear)
                     }
                     if visibleLines.isEmpty {
-                        ContentUnavailableView.search(text: searchText)
+                        TowerContentUnavailableView.search(text: searchText)
                             .listRowBackground(Color.clear)
                     } else {
                         Section {

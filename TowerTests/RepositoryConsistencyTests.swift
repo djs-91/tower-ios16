@@ -484,7 +484,8 @@ final class RepositoryConsistencyTests: XCTestCase {
         )
         XCTAssertFalse(menuSource.contains("Toggle("))
         XCTAssertTrue(menuSource.contains("toggleRuleGroupEmojiVisibilityAfterMenuDismiss()"))
-        XCTAssertTrue(menuSource.contains(".menuActionDismissBehavior(.enabled)"))
+        // iOS 16 port: .menuActionDismissBehavior is iOS 17+ and is removed.
+        XCTAssertFalse(menuSource.contains(".menuActionDismissBehavior("))
         XCTAssertTrue(sheetSource.contains("private func toggleRuleGroupEmojiVisibilityAfterMenuDismiss()"))
         XCTAssertTrue(sheetSource.contains("Task.sleep(for: .milliseconds(180))"))
         XCTAssertTrue(sheetSource.contains("transaction.disablesAnimations = true"))
@@ -655,7 +656,9 @@ final class RepositoryConsistencyTests: XCTestCase {
         XCTAssertTrue(
             pickerSource.contains(".opacity(visualSessions.contains(where: { $0.source == destination }) ? 0 : 1)")
         )
-        XCTAssertTrue(pickerSource.contains("completionCriteria: .removed"))
+        // iOS 16 port: completionCriteria is iOS 17+; the reorder settles via
+        // withAnimation16 plus a token-guarded dispatch instead.
+        XCTAssertFalse(pickerSource.contains("completionCriteria:"))
         XCTAssertFalse(pickerSource.contains(".onDrag("))
         XCTAssertFalse(pickerSource.contains(".onDrop("))
         XCTAssertFalse(pickerSource.contains(".dropDestination(for:"))
@@ -680,13 +683,15 @@ final class RepositoryConsistencyTests: XCTestCase {
         XCTAssertTrue(filter.contains("sourceFrame.minY + dragSession.translation"))
         XCTAssertTrue(filter.contains("let isLifted = !isPreview && visualSessions.contains"))
         XCTAssertTrue(filter.contains("ReorderAutoScroller("))
-        XCTAssertTrue(filter.contains("completionCriteria: .removed"))
+        // iOS 16 port: completionCriteria is iOS 17+ and is removed here too.
+        XCTAssertFalse(filter.contains("completionCriteria:"))
         XCTAssertFalse(filter.contains("Task.sleep"))
         XCTAssertFalse(filter.contains(".scrollDisabled("))
         XCTAssertTrue(filter.contains("@Environment(\\.accessibilityReduceMotion)"))
         XCTAssertTrue(filter.contains("withAnimation(TowerMotion.disclosure(reduceMotion: false))"))
         XCTAssertTrue(filter.contains(".transition(.opacity)"))
-        XCTAssertTrue(filter.contains(".sensoryFeedback(.selection"))
+        // iOS 16 port: .sensoryFeedback is iOS 17+; haptics are omitted.
+        XCTAssertFalse(filter.contains(".sensoryFeedback("))
         XCTAssertFalse(filter.contains(".onMove("))
         XCTAssertFalse(filter.contains("editMode"))
         XCTAssertTrue(filter.contains(".frame(maxWidth: .infinity, alignment: .leading)"))
