@@ -1,3 +1,5 @@
+> ⚠️ **这是非官方 iOS 16 移植版**，基于上游 [pengchujin/tower](https://github.com/pengchujin/tower) **v1.0.31 (73)**，降级到 **iOS 16.0+** 可运行。改动仅为 API 降级，不含产品逻辑修改。完整说明见 [BUILD_IOS16.md](BUILD_IOS16.md)。
+
 <div align="center">
 
 <img src="docs/images/icon.png" width="128" alt="塔台图标">
@@ -8,11 +10,7 @@
 
 在 iPhone、iPad 和 Mac 上管理机场订阅与自有节点，选好分流规则，一键导入你常用的客户端。
 
-<a href="https://github.com/pengchujin/tower/releases/download/v1.0.31-73/Tower-1.0.31-73-macOS-universal.dmg"><img src="docs/images/download-mac.svg" width="210" height="48" alt="免费下载 Mac 版"></a>
-&nbsp;
-<a href="https://apps.apple.com/app/id6797458927"><img src="docs/images/download-ios.svg" width="210" height="48" alt="App Store 支持"></a>
-
-[使用指南](https://tower.shenqi.uk) · [更新日志](https://github.com/pengchujin/tower/releases) · [反馈问题](https://github.com/pengchujin/tower/issues)
+[使用指南](https://tower.shenqi.uk) · [上游更新日志](https://github.com/pengchujin/tower/releases) · [反馈问题](https://github.com/djs-91/tower-ios16/issues)
 
 </div>
 
@@ -83,20 +81,11 @@
 
 [隐私政策](docs/privacy.md) · [使用与支持](docs/support.md)
 
-## 下载与安装
-
-- **iPhone / iPad**：[App Store](https://apps.apple.com/app/id6797458927)
-- **Mac**：[下载 DMG](https://github.com/pengchujin/tower/releases/download/v1.0.31-73/Tower-1.0.31-73-macOS-universal.dmg)，或使用 Homebrew：
-
-```sh
-brew install --cask pengchujin/tap/tower
-```
-
 ---
 
 <div align="center">
 
-[开发指南](docs/DEVELOPMENT.md) · [架构](docs/ARCHITECTURE.md) · [发布流程](docs/RELEASING.md) · [贡献前必读](CLAUDE.md)
+[开发指南](docs/DEVELOPMENT.md) · [架构](docs/ARCHITECTURE.md) · [iOS 16 移植说明](BUILD_IOS16.md)
 
 源码采用 [MIT](LICENSE) 许可。第三方资源按各自许可证分发，详见 [第三方声明](THIRD-PARTY-NOTICES.md)。
 

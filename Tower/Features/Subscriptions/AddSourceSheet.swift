@@ -3,7 +3,7 @@ import UIKit
 
 struct AddSourceSheet: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(AppModel.self) private var model
+    @EnvironmentObject private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     private let editingNode: ProxyNode?
     @State private var name = ""
@@ -73,6 +73,25 @@ struct AddSourceSheet: View {
     /// The input `detectedKind` describes; saving waits until they agree.
     @State private var detectedValue = ""
 
+    private var addSheetCancelItem: some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            Button("取消") {
+                requestsDiscard = true
+            }
+        }
+    }
+
+    private var addSheetConfirmItem: some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button(saveButtonTitle) {
+                focusedField = nil
+                saveTask = Task { await save() }
+            }
+            .disabled(isSaveDisabled)
+            .accessibilityIdentifier("save-source")
+        }
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -107,24 +126,15 @@ struct AddSourceSheet: View {
             .navigationTitle(editingNode == nil ? String(localized: "添加订阅或节点") : String(localized: "编辑"))
             .navigationBarTitleDisplayMode(.inline)
             .scrollDismissesKeyboard(.interactively)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("取消") {
-                        requestsDiscard = true
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(saveButtonTitle) {
-                        focusedField = nil
-                        saveTask = Task { await save() }
-                    }
-                    .disabled(isSaveDisabled)
-                    .accessibilityIdentifier("save-source")
-                }
-                // Only manual entry needs a way out of the keyboard: its port
-                // and similar fields use a number pad, which has no return
-                // key. Pasting and scanning dismiss with a scroll, as the
-                // page already allows, without a control floating over it.
+            .toolbar16 {
+                addSheetCancelItem
+                addSheetConfirmItem
+            }
+            // Only manual entry needs a way out of the keyboard: its port
+            // and similar fields use a number pad, which has no return
+            // key. Pasting and scanning dismiss with a scroll, as the
+            // page already allows, without a control floating over it.
+            .toolbar16 {
                 ToolbarItemGroup(placement: .keyboard) {
                     if entryMode == .manual {
                         Spacer()
@@ -141,7 +151,7 @@ struct AddSourceSheet: View {
                 saveTask?.cancel()
                 cancelClipboardRead()
             }
-            .onChange(of: sourceValue) {
+            .onChange(of: sourceValue) { _ in
                 cancelClipboardRead()
                 errorMessage = nil
             }
@@ -158,7 +168,7 @@ struct AddSourceSheet: View {
                 detectedKind = kind
                 detectedValue = value
             }
-            .onChange(of: entryMode) {
+            .onChange(of: entryMode) { _ in
                 cancelClipboardRead()
                 focusedField = nil
                 errorMessage = nil
@@ -311,7 +321,7 @@ struct AddSourceSheet: View {
                     .tag(kind)
                 }
             }
-            .onChange(of: manualDraft.kind) { _, selectedKind in
+            .onChange(of: manualDraft.kind) { selectedKind in
                 manualDraft.applyDefaults(for: selectedKind)
             }
         }

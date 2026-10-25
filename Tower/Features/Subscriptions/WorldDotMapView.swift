@@ -541,14 +541,14 @@ struct WorldDotMapView: View {
                 panGesture(in: geometry.size),
                 including: viewport.scale > Viewport.minimumScale + 0.001 || viewportAnimationToken != nil ? .gesture : .none
             )
-            .onChange(of: geometry.size) { _, size in
+            .onChange(of: geometry.size) { size in
                 let normalized = viewport.normalized(in: size)
                 viewportAnimationToken = nil
                 updateViewportWithoutAnimation(normalized)
                 displayedLevel = normalized.level
                 settleRasterIfIdle()
             }
-            .onChange(of: selectedMarkerID) { _, markerID in
+            .onChange(of: selectedMarkerID) { markerID in
                 guard let markerID,
                       let marker = markers.first(where: { $0.id == markerID }) else {
                     return
@@ -686,7 +686,7 @@ struct WorldDotMapView: View {
     }
 
     private func magnifyGesture(in size: CGSize) -> some Gesture {
-        MagnifyGesture()
+        MagnificationGesture()
             .onChanged { value in
                 if magnifyStartViewport == nil {
                     takeOverViewport(in: size)
@@ -694,16 +694,16 @@ struct WorldDotMapView: View {
                 }
                 guard let start = magnifyStartViewport else { return }
                 updateViewportWithoutAnimation(start.zoomed(
-                    to: start.scale * value.magnification,
-                    anchor: value.startAnchor,
+                    to: start.scale * value,
+                    anchor: .center,
                     in: size
                 ))
             }
             .onEnded { value in
                 guard let start = magnifyStartViewport else { return }
                 let settled = start.zoomed(
-                    to: start.scale * value.magnification,
-                    anchor: value.startAnchor,
+                    to: start.scale * value,
+                    anchor: .center,
                     in: size
                 ).normalized(in: size)
                 magnifyStartViewport = nil
@@ -984,10 +984,10 @@ struct WorldDotMapView: View {
             isRecenteringSelection = true
         }
 
-        withAnimation(.spring(response: 0.38, dampingFraction: 1)) {
+        withAnimation16(.spring(response: 0.38, dampingFraction: 1), {
             viewport = target
             displayedLevel = target.level
-        } completion: {
+        }, completion: {
             guard selectionRecenterToken == token else { return }
             selectionRecenterToken = nil
             if viewportAnimationToken == token { viewportAnimationToken = nil }
@@ -1000,7 +1000,7 @@ struct WorldDotMapView: View {
                 isRecenteringSelection = false
             }
             settleRasterIfIdle()
-        }
+        })
     }
 
     private func captureLabelSnapshot(in size: CGSize) -> [FrozenLabel] {
@@ -1052,8 +1052,11 @@ struct WorldDotMapView: View {
     private func withViewportAnimation(_ animation: Animation? = nil, _ updates: () -> Void) {
         let token = UUID()
         viewportAnimationToken = reduceMotion ? nil : token
-        withAnimation(reduceMotion ? nil : animation ?? .spring(response: 0.34, dampingFraction: 1),
-                      completionCriteria: .removed, updates) {
+        withAnimation(reduceMotion ? nil : animation ?? .spring(response: 0.34, dampingFraction: 1)) {
+            updates()
+        }
+        // iOS 16 has no completion criterion, so settle on the next turn.
+        DispatchQueue.main.async {
             guard viewportAnimationToken == token else { return }
             viewportAnimationToken = nil
             settleRasterIfIdle()

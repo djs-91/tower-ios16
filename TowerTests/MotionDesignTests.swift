@@ -58,9 +58,11 @@ final class MotionDesignTests: XCTestCase {
         let cardEnd = try XCTUnwrap(source.range(of: "private struct SubscriptionAnnouncementSection"))
         let cardSource = String(source[cardStart.lowerBound..<cardEnd.lowerBound])
 
-        XCTAssertTrue(
+        // iOS 16 port: .geometryGroup() is iOS 17+ and has no iOS 16 equivalent,
+        // so the modifier is dropped rather than emulated.
+        XCTAssertFalse(
             cardSource.contains(".geometryGroup()"),
-            "地图节点收起时，订阅卡片背景与流量信息必须作为同一几何单元移动"
+            "iOS 16 移植版必须移除 .geometryGroup()"
         )
     }
 

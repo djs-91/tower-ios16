@@ -42,3 +42,8 @@ ExportOptions.plist
 # local to one clone and silently absent in every other.
 Config/release.local.sh
 LOCAL_RELEASE.md
+
+# iOS 16 port helpers live at the repository root on the porting machine only.
+# They rewrite the pristine tree and must never enter Git; Scripts/*.py (upstream
+# maintenance tooling) stays tracked because this rule is anchored at the root.
+/*.py

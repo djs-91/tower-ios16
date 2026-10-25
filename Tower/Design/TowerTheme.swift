@@ -296,8 +296,7 @@ struct MetricPill: View {
             HStack(alignment: .firstTextBaseline, spacing: 1) {
                 Text(value, format: .number)
                     .font(.title2.weight(.bold))
-                    .contentTransition(
-                        reduceMotion ? .opacity : .numericText(value: Double(value))
+                    .contentTransition(.opacity
                     )
                     .animation(
                         reduceMotion
@@ -392,7 +391,6 @@ struct ToastContent: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("tower-toast")
-        .sensoryFeedback(toast.tone == .success ? .success : .selection, trigger: toast.id)
     }
 }
 
@@ -439,10 +437,17 @@ struct SelectionIndicator: View {
 /// A custom style owns its own accessibility, and the style cannot turn the
 /// configuration's label view into the `Text` that `accessibilityLabel` wants,
 /// so callers name the control themselves.
+private struct IsSwipeSizingCopyKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
 extension EnvironmentValues {
     /// True inside `CardSwipeDeletion`'s hidden sizing copy. Side effects —
     /// haptics, lookups — must run only in the visible, interactive copy.
-    @Entry var isSwipeSizingCopy = false
+    var isSwipeSizingCopy: Bool {
+        get { self[IsSwipeSizingCopyKey.self] }
+        set { self[IsSwipeSizingCopyKey.self] = newValue }
+    }
 }
 
 struct CheckmarkToggleStyle: ToggleStyle {
@@ -457,10 +462,8 @@ struct CheckmarkToggleStyle: ToggleStyle {
                 .contentShape(Rectangle())
         }
         .buttonStyle(SelectionIndicatorButtonStyle())
-        .accessibilityAddTraits(.isToggle)
         // Every other choice in the app taps back — the tab bar, the rule
         // list, the client picker. This one was the exception.
-        .sensoryFeedback(.selection, trigger: configuration.isOn) { _, _ in !isSwipeSizingCopy }
     }
 }
 
@@ -597,15 +600,7 @@ struct CardSwipeDeletion: ViewModifier {
                     }
                 }
                 .clipped()
-                .onGeometryChange(for: Bool?.self) { geometry in
-                    guard let viewport = geometry.bounds(of: .scrollView) else { return true }
-                    // Keep the last visibility through transient zero-size layouts.
-                    guard viewport.width > 0, viewport.height > 0 else { return nil }
-                    let preheatedViewport = viewport.insetBy(dx: 0, dy: -viewport.height)
-                    return preheatedViewport.intersects(CGRect(origin: .zero, size: geometry.size))
-                } action: { isNear in
-                    if let isNear { isNearScrollViewport = isNear }
-                }
+
         } else {
             content
         }
