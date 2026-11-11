@@ -1,0 +1,250 @@
+# TestFlight 发布流程
+
+
+公证的 `xcodebuild -exportArchive` 返回上传成功后，还须在正式发布机使用同一归档执行 `xcodebuild -exportNotarizedApp -archivePath <归档路径> -exportPath <公证版导出目录>`。仅有公证提交成功不代表该目录已包含应用；取回后再验证 `stapler validate`、严格签名与 Gatekeeper，通过后制作 DMG。
+
+Mac 分发启动验收必须使用公开回下载的包，保留正常下载隔离标记，安装后从 Finder 打开并确认主界面可交互；退出后再次打开复核。`spctl` / `stapler` / 严格签名通过以及可执行进程短暂存在，都不能代替这一步。遇到拦截时保存系统日志并核对实际安装实例，不要删除隔离标记或关闭 Gatekeeper 来取得通过结果。
+
+## Mac Homebrew 分发
+
+独立 tap 仓库为 https://github.com/pengchujin/homebrew-tap ，安装命令为 `brew install --cask pengchujin/tap/tower`。
+
+新的 Mac DMG 完成 Developer ID 签名、公证并公开到 GitHub Releases 后，先将主仓库 README 的 Mac 下载按钮链接更新为新版 DMG 的直接下载地址，再同步更新 tap 中 `Casks/tower.rb` 的版本、构建号与该文件的 SHA-256。执行 `brew style --cask pengchujin/tap/tower`、`brew audit --cask pengchujin/tap/tower` 并验证安装后推送；仅发布 GitHub Release 不会自动更新 cask。 后续更新只改版本、构建号和 SHA-256，保留当前 cask 语法：URL 不加已弃用的 `verified:`，最低系统按 Homebrew 主版本处理：7 及以上使用 `:sonoma`，旧版使用 `">= :sonoma"`，确保均表示 macOS 14 及以上；不要从旧模板恢复弃用写法。cask 的 homepage 保持官方 GitHub 仓库，与下载域名一致，兼容仍要求跨域 verified 的旧版 Homebrew。用户运行 `brew update` 和 `brew upgrade --cask pengchujin/tap/tower` 获取新包。
+
+Cask 将应用安装为「塔台.app」，区分同名 Tower Git 客户端；不删除用户订阅、设置或 iCloud 数据。
+
+自 2026-09-18 起，家中 Mac mini M4 已升级正式版 macOS，优先使用本机 `/Applications/Xcode.app/Contents/Developer` 完成自动签名、归档、Mac 公证和 TestFlight 上传。MacBook Air M2 出门时也可本机发布；Mac mini M2 保留为远程备用发布机。首次切换须核对实际 Xcode 版本、账号和签名，并分别验证归档、上传与 Apple 处理状态。
+
+最近已上传版本见 [HANDOFF](HANDOFF.md)。版本已获批、预发布通道关闭后必须递增 MARKETING_VERSION，不能只递增 build。
+
+备用远程流程会从开发机上的 Ghostty 通过 SSH 连接 Mac mini M2，再自动切换到该机的 Aqua 图形会话归档和上传，避免 SSH Background 安全域导致 `codesign` 报 `errSecInternalComponent`。登录钥匙串密码仅在当次终端由 macOS `security` 读取，不写入仓库、脚本、Shell 历史或命令参数。
+
+## 前置条件
+
+- 本地仓库工作区必须干净，并且 `HEAD` 与 `origin/main` 完全一致。
+- 随 App 打包的 ACL4SSR 快照必须对应上游最新提交；发布脚本会联网检查并在过期时中止。
+- 工程中的 `MARKETING_VERSION` 和 `CURRENT_PROJECT_VERSION` 必须已经更新并推送。
+- M4 / Air 本机归档不需要 `TOWER_RELEASE_HOST`、远端仓库或 Ghostty；它必须处于 Aqua 会话，并使用 `/Applications/Xcode.app/Contents/Developer`。本机已登录开发账号，存在可用证书和匹配 `com.jzb.tower` 的描述文件。
+- M4 / Air 本机上传前必须在 Xcode **Settings ▸ Accounts** 确认 Apple Account 已登录且能看到对应团队；账号还需具有 App Store Connect 访问权限，或提供单独的 App Store Connect API Key。只有开发证书和描述文件不能证明账号已登录或具备上传能力。
+- Mac mini M2 发布机必须安装 `/Applications/Xcode.app`，其登录钥匙串中需要存在可用的 Apple Development 或 Apple Distribution 签名身份，并由具有 App Store Connect 权限的账号完成上传。
+- 远程备用流程的开发机和 Mac mini M2 各自需要 `Config/release.local.sh` 中与自身职责对应的私有值（见下一节）；开发机还需安装 Ghostty。SSH 优先使用现有公钥，没有公钥时由 SSH 自己交互询问密码。
+- 三台 Mac 都不要依赖或切换全局 `xcode-select`。运行命令前显式设置 `DEVELOPER_DIR` 并用 `xcodebuild -version` 复核。
+
+## 打包前更新内置规则
+
+内置 ACL4SSR 规则属于 App 资源，不会在用户设备上自动更新。每次 TestFlight 或 App Store 打包前，发布脚本会同时检查上游快照新鲜度和全部远程二进制：
+
+```sh
+python3 Scripts/update_acl4ssr_rules.py --check-latest
+python3 Scripts/update_acl4ssr_rules.py --verify-published
+```
+
+如果上游已有新提交，脚本会在签名和归档之前停止。回到开发仓库执行：
+
+```sh
+python3 Scripts/update_acl4ssr_rules.py --latest \
+  --mihomo <Mihomo 可执行文件路径> \
+  --mihomo-version 1.19.31 \
+  --sing-box <sing-box 可执行文件路径> \
+  --sing-box-version 1.14.2
+```
+
+更新器会先解析上游最新提交号，再下载三份 ACL4SSR 配置及其引用的全部规则集，把 URL 固定到该提交，并重新生成 `Tower/Resources/ACL4SSR/ACL4SSR_manifest.json` 中的来源、规则数量和 SHA-256。同时它只把没有额外参数的 `DOMAIN` / `DOMAIN-SUFFIX` 转成 domain 行为的 MRS；`IP-CIDR` / `IP-CIDR6` / `IP6-CIDR` 只有在该列表的每一行都恰好带一个 `no-resolve` 时才转成 ipcidr MRS，并在清单中写入 `noResolve: true`。任一同类行无法无损转换时，整类规则都保留给生成器内联。
+
+同一更新会为每个可转换列表生成一个 sing-box source-format v2 SRS：`DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD` 以及三种 CIDR 别名合并进一个二进制；CIDR 可不带参数或只带一个 `no-resolve`，其他附加参数会让完整 IP 类型族留在内联规则里。清单的 `coveredRuleTypes` 明确记录真正移入 SRS 的源类型，且 `inputRuleCount + residualRuleCount` 必须等于原规则总数。临时 source JSON 只用于编译，SRS 随后立即反编译并做语义等价检查；JSON 源文件和反编译文件都不会托管。
+
+同一列表的 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD` 部分另编译成 `_singbox_domain.srs`，供 sing-box MT 的 DNS 规则按域名引用。更新器还生成 Loon（`_loon.list`）、Quantumult X（`_quanx.list`，每行写占位策略 `proxy`，由 `force-policy` 替换）和 Egern（`_egern.yaml`）格式的同内容列表，以及 `Tower_GEOIP_CN_loon.list`、`Tower_GEOIP_CN_quanx.list`、`Tower_catch_all_quanx.list` 三个固定内容文件。App 按随包文本独立复算每种格式覆盖的类型和条数，固定内容文件直接比对 SHA-256，任何一项不符就退回内联。
+
+MRS、SRS 与这些列表最后都放到 `Rulesets/ACL4SSR/<提交号>/`，不随 App 打包。必须显式传入自己核验过的 Mihomo 与 sing-box 可执行文件；脚本分别检查 `-v` 和 `version` 输出，不会自动下载，也不会信任 PATH 里的同名命令。
+
+二进制产物与引用它的 App manifest 必须分两个提交发布，避免 commit SHA 自引用：
+
+1. 先执行上述命令生成预备产物。此时 manifest 临时指向 `main`，只能用于准备，不得打包。检查 `git diff -- Tower/Resources/ACL4SSR Rulesets/ACL4SSR`，确认只有预期的上游规则与可复现 MRS/SRS 变化，且没有临时 `.json` 文件。
+2. 运行 `python3 Scripts/tests/update_acl4ssr_rules_test.py`，然后只提交并推送 `Rulesets/ACL4SSR/<ACL4SSR 提交号>/`。记下这个 Tower 产物提交的完整 40 位 SHA（下文记为 `<ARTIFACT_COMMIT>`）；不得 force-push 或改写包含它的历史。
+3. 用同一 ACL4SSR 提交和同一对编译器再生成一次，把清单绑定到不可变的 Tower commit URL：
+
+   ```sh
+   python3 Scripts/update_acl4ssr_rules.py --revision <ACL4SSR 完整提交号> \
+     --artifact-commit <ARTIFACT_COMMIT> \
+     --mihomo <Mihomo 可执行文件路径> \
+     --mihomo-version 1.19.31 \
+     --sing-box <sing-box 可执行文件路径> \
+     --sing-box-version 1.14.2
+   ```
+
+   生成后 `ACL4SSR_manifest.json` 必须包含 `artifactCommit`】【，】【所有 MRS/SRS URL 都必须含该完整 SHA，不能再含 `/main/`。
+4. 推送引用清单和 App 代码的第二个提交后，全量回读所有远程 MRS、SRS 与 Loon / QuanX / Egern 列表并校验 SHA-256：
+
+   ```sh
+   python3 Scripts/update_acl4ssr_rules.py --verify-published
+   ```
+
+   任何 URL 返回 404、仍指向可变 `main`、或摘要不一致时都会失败，不得打包。
+5. 运行 `bash Scripts/tests/release_testflight_test.sh` 和完整 iOS 测试，确认工作区干净后再运行发布脚本。不要在归档过程中保留未提交的资源变化，否则归档产物无法对应 Git 提交。
+
+需要复现旧快照时可以明确指定完整提交号：
+
+```sh
+python3 Scripts/update_acl4ssr_rules.py --revision <完整提交号> \
+  --mihomo <Mihomo 可执行文件路径> \
+  --mihomo-version 1.19.31 \
+  --sing-box <sing-box 可执行文件路径> \
+  --sing-box-version 1.14.2
+```
+
+## 策略组图标
+
+`Scripts/update_policy_group_icons.py` 生成两样东西：`Tower/Resources/PolicyGroupIcons/PolicyGroupIcons_manifest.json`（Fluent Emoji 3D 的 Emoji → 图片路径索引，随 App 打包，图片本身由客户端从 jsDelivr 的固定提交读取）、`Rulesets/PolicyGroupIcons/<flag-icons 提交号>/` 下 187 张圆形国旗 PNG，以及 `Rulesets/PolicyGroupIcons/FluentCircle/` 下给 QuanX 的 144px 圆底图标（全部 Fluent Emoji 加 187 面国旗，约 17 MB，从 raw.githubusercontent.com 读取）。必须显式传入 `--rsvg <rsvg-convert 路径>`。
+
+国旗和规则集一样分两个提交发布：先不带 `--artifact-commit` 生成（清单里的国旗地址指向 `main`，App 只用 Fluent、地区组不写图标），只提交并推送 `Rulesets/PolicyGroupIcons/`；再用该提交号 `--artifact-commit <提交号>` 重新生成清单，提交 App 端，最后用 `--verify-published` 回读每一面国旗的 SHA-256。圆底图标同样两步：先推送 `Rulesets/PolicyGroupIcons/FluentCircle/`，再用 `--circle-commit <提交号>`（同时带上国旗的 `--artifact-commit`，否则国旗地址会退回 `main`）重新生成清单；未绑定时 QuanX 写 SF Symbols。`--verify-published` 会一起回读两组图片。
+
+## 本地配置
+
+本仓库是公开的，所以构建机地址、它的仓库路径和 Apple 团队 ID 都不写进 Git。远程发布需要的私有值放在 `Config/release.local.sh`；该文件已被 `.gitignore` 忽略，每台机器只填写自己需要的项目：
+
+```sh
+# 开发机（运行 Scripts/release_testflight.sh 的那台）
+TOWER_RELEASE_HOST="${TOWER_RELEASE_HOST:-用户名@构建机地址}"
+TOWER_RELEASE_REPO="${TOWER_RELEASE_REPO:-/构建机上的仓库路径}"
+
+# 做签名和归档的机器
+TOWER_DEVELOPMENT_TEAM="${TOWER_DEVELOPMENT_TEAM:-你的团队 ID}"
+```
+
+M4 / Air 本机归档不需要 `TOWER_RELEASE_HOST`、`TOWER_RELEASE_REPO` 或 Ghostty。工程故意没有把 `DEVELOPMENT_TEAM` 写进项目文件，所以命令行归档仍必须在进程环境或构建参数中提供团队。若本机没有本地配置，可从与 `com.jzb.tower` 匹配且未过期的描述文件中确认唯一的 `TeamIdentifier`，只保存在当前 Shell 变量中；找不到或出现多个不同团队时停止，不要猜，也不要把结果打印到日志或写进仓库。看到 `Signing for Tower requires a development team` 只说明命令没有传这个参数，不代表 Xcode 没登录。
+
+用 `${VAR:-…}` 写法是为了让环境变量优先，这样临时换一台机器发布不需要改文件：
+
+```sh
+TOWER_RELEASE_HOST=用户名@另一台 Scripts/release_testflight.sh
+```
+
+也可以用 `--host`、`--remote-repo` 命令行参数覆盖。任何一个值缺失时脚本会直接停下并说明该往哪里填，不会带着错误的默认值继续。
+
+`Config/ExportOptions-TestFlight.plist` 因此**不含 `teamID`**；`Scripts/release_testflight_remote.sh` 会把它复制到发布目录再补上团队 ID，渲染结果始终落在仓库之外。
+
+## 上传账号排错
+
+归档成功只证明签名材料可用，不证明当前正式版 Xcode 已登录 Apple Account。出现 `Failed to Use Accounts` 时：
+
+1. 检查实际使用的 Xcode → Settings → Accounts 中的账号和团队。
+2. 完成登录后，构建号尚未成功上传时可复用原归档重新分发，无需重打包。
+3. 账号正常仍失败，再检查 App Store Connect 权限、协议或 API Key。
+4. 不擅自退出其他 Xcode、撤销证书或切换全局 xcode-select。
+
+本机终端应处于 Aqua 会话；签名和上传用正式版 Xcode。普通真机安装另见 [DEVELOPMENT](DEVELOPMENT.md)。
+
+## M4 / Air 本机发布
+
+从当前已授权访问仓库的本机终端运行，不使用 SSH，也不切换全局 Xcode。避免通过新建 LaunchAgent 读取 Documents 下的仓库：独立后台进程可能没有该目录的隐私授权。签名失败时先检查当前用户会话和 Xcode 账号，不修改钥匙串访问控制。
+
+在私有配置中设置本机团队后，可复用归档脚本的本机入口：
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+xcodebuild -version
+source Config/release.local.sh
+export TOWER_DEVELOPMENT_TEAM
+git fetch origin main
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+# 版本与构建号替换为本次发布值；目录使用新的绝对路径。
+bash Scripts/release_testflight_remote.sh --aqua \
+  --version 1.0.21 --build 59 --commit "$(git rev-parse HEAD)" \
+  --release-dir "$HOME/Builds/Tower-TestFlight-1.0.21-59"
+```
+
+`--aqua` 直接执行当前机器上的归档和上传，不发起远程连接。上传成功后在 App Store Connect 核对构建处理状态、测试说明和群组可用性，不把上传成功当作外部测试审核通过。
+
+## 用 asc 发布 TestFlight（M4 / Air 本机，当前主流程）
+
+自 1.0.26 起 TestFlight 用 [asc](https://asccli.sh)（`brew install asc`，App Store Connect 命令行工具）上传和分发：本机没有 Distribution 证书，导出走 asc 配置的 App Store Connect API Key 云签名，上传、测试说明、外部群组和 Beta 审核也都由 asc 完成。`Scripts/release_testflight*.sh` 保留给 Mac mini M2 的远程备用流程。
+
+前置检查：`asc auth doctor` 显示默认 profile 完整、私钥在钥匙串中；App ID 用 `asc apps list --bundle-id com.jzb.tower` 查，团队 ID 按「本地配置」一节取，两者都只放在当前 Shell 变量里，不写进仓库。
+
+```sh
+export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+APP_ID=<App Store Connect App ID>; TEAM=<团队 ID>
+OUT="$HOME/Builds/Tower-<版本>-<构建号>"; mkdir -p "$OUT"
+
+# 1. 两端归档（发布提交已推送，工作区干净，HEAD 与 origin/main 一致）
+asc xcode archive --project Tower.xcodeproj --scheme Tower --configuration Release \
+  --archive-path "$OUT/Tower-ios.xcarchive" \
+  --xcodebuild-flag=-destination --xcodebuild-flag=generic/platform=iOS \
+  --xcodebuild-flag=-allowProvisioningUpdates --xcodebuild-flag=DEVELOPMENT_TEAM=$TEAM
+asc xcode archive --project Tower.xcodeproj --scheme Tower --configuration Release \
+  --archive-path "$OUT/Tower-mac.xcarchive" \
+  --xcodebuild-flag=-destination --xcodebuild-flag="generic/platform=macOS,variant=Mac Catalyst" \
+  --xcodebuild-flag=-allowProvisioningUpdates --xcodebuild-flag=DEVELOPMENT_TEAM=$TEAM
+
+# 2. 导出（云签名；本机没有 Distribution 证书，必须带 -allowProvisioningUpdates）
+asc xcode export --archive-path "$OUT/Tower-ios.xcarchive" --ipa-path "$OUT/Tower.ipa" --team-id $TEAM \
+  --xcodebuild-flag=-allowProvisioningUpdates
+asc xcode export --archive-path "$OUT/Tower-mac.xcarchive" --pkg-path "$OUT/Tower.pkg" --team-id $TEAM \
+  --xcodebuild-flag=-allowProvisioningUpdates
+
+# 3. 上传、等处理、写测试说明、加入外部群组「测试」并提交 Beta 审核
+asc publish testflight --app $APP_ID --ipa "$OUT/Tower.ipa" \
+  --group "测试" --test-notes "$(cat "$OUT/test-notes.txt")" --locale zh-Hans --wait --submit --confirm
+asc publish testflight --app $APP_ID --pkg "$OUT/Tower.pkg" --platform MAC_OS \
+  --version <版本> --build-number <构建号> \
+  --group "测试" --test-notes "$(cat "$OUT/test-notes.txt")" --locale zh-Hans --wait --submit --confirm
+
+# 4. 回读
+asc status --app $APP_ID
+```
+
+- 导出报 `PLA Update available` 时，是 Apple 开发者计划许可协议有更新：由账户持有人在 developer.apple.com/account 接受后重试即可，不需要重新归档（1.0.31 遇到）。随后的 `No signing certificate "iOS Distribution" found` 是同一原因。
+- 测试说明不能含 Emoji，App Store Connect 会拒收（1.0.30 遇到 🌐 🤖）；用文字描述图标。
+- 内部群组自动接收新构建，手动添加会被拒绝，只需处理外部群组。
+- 上传前核对归档里的 Bundle ID、版本、构建号；Mac 包须含 arm64 与 x86_64。
+- 归档、导出包、日志和回执留在 `~/Builds/`，不进仓库。
+- 版本已在 App Store 上架（`asc status` 的 appstore.state 为 READY_FOR_DISTRIBUTION）后必须先递增 MARKETING_VERSION。
+- Mac 直接分发（GitHub / Homebrew）不能用 API Key：用同一 Mac 归档以 `developer-id` 方式导出并公证，需要 Xcode ▸ Settings ▸ Accounts 已登录，见文首与「Mac Homebrew 分发」。
+
+## Mac mini M2 备用发布：一条命令
+
+在塔台仓库根目录执行：
+
+```sh
+Scripts/release_testflight.sh
+```
+
+脚本会自动读取工程版本号和构建号，校验本地与远端 Git 状态，然后打开 Ghostty。按 Ghostty 中的提示输入 Mac mini 登录/钥匙串密码即可。输入不会显示，也不会保存。
+
+需要明确约束目标版本时：
+
+```sh
+Scripts/release_testflight.sh --version <版本号> --build <构建号>
+```
+
+只做校验、不连接 Mac mini：
+
+```sh
+Scripts/release_testflight.sh --dry-run
+```
+
+如果已经处于 Ghostty 或其他交互终端：
+
+```sh
+Scripts/release_testflight.sh --no-ghostty
+```
+
+## 远程发布脚本会做什么
+
+1. 拒绝带未提交文件的本地工作区。
+2. 联网上游检查随包 ACL4SSR 快照；不是最新版本就停止并给出更新命令。
+3. 拉取 `origin/main`，确认本地提交已经完整推送。
+4. 打开 Ghostty，以交互 SSH 连接 Mac mini。
+5. Mac mini 快进到同一个提交，再次核对版本、构建号、工作区和内置规则版本。
+6. 需要时交互解锁登录钥匙串，确认签名身份可见。
+7. 自动在 Mac mini M2 的 Terminal/Aqua 会话中使用正式版 Xcode 和 Release 配置归档，并将日志实时回传到 Ghostty。
+8. 把 `Config/ExportOptions-TestFlight.plist` 复制到发布目录、补上 `TOWER_DEVELOPMENT_TEAM`，再用它上传 App Store Connect。
+9. 将归档与日志保存在 Mac mini 的 `~/Builds/Tower-TestFlight-版本-构建号-时间/`。
+
+脚本成功只代表 Xcode 上传命令完成。发布后仍需在 App Store Connect 确认构建已出现、处理完成，以及是否加入了正确的 TestFlight 测试群组。
+
+## 测试发布脚本
+
+```sh
+bash Scripts/tests/release_testflight_test.sh
+```

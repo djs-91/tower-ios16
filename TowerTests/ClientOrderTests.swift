@@ -1,0 +1,430 @@
+import XCTest
+@testable import Tower
+
+@MainActor
+final class ClientOrderTests: XCTestCase {
+    func testExistingMacPreferencesInsertFlClashAfterClashMacAndKeepHiddenChoice() throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("tower-flclash-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let store = PersistenceStore(fileURL: file)
+        var snapshot = AppSnapshot(subscriptions: [], nodes: [], selectedPresetID: AppModel.defaultRuleSchemeID, selectedTarget: .shadowrocket)
+        let oldOrder = ClientPlatform.mac.defaultOrder.filter { $0 != .flClash }
+        snapshot.macClientPreferences = ClientPlatformPreferences(order: oldOrder.map(\.rawValue), visibleTargets: oldOrder.map(\.rawValue), lanSharingIndex: 1, isLANSharingVisible: true, selectedTarget: .clashMac)
+        try store.save(snapshot)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .mac)
+        let index = try XCTUnwrap(model.clientOrder.firstIndex(of: .clashMac))
+        XCTAssertEqual(model.clientOrder[index + 1], .flClash)
+        XCTAssertTrue(model.visibleClientTargets.contains(.flClash))
+        XCTAssertEqual(model.clientOrder[index + 2], .mihomoParty)
+        XCTAssertTrue(model.visibleClientTargets.contains(.mihomoParty))
+        model.setClient(.mihomoParty, isVisible: false)
+        model.setClient(.flClash, isVisible: false)
+        let restored = AppModel(persistence: store, arguments: [], clientPlatform: .mac)
+        XCTAssertFalse(restored.visibleClientTargets.contains(.flClash))
+        XCTAssertFalse(restored.visibleClientTargets.contains(.mihomoParty))
+    }
+
+    func testPlatformPreferencesSurviveAlternatingSnapshotWrites() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("tower-platform-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let phone = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        phone.moveExportDestination(.client(.surge), across: .client(.shadowrocket))
+        phone.setClient(.loon, isVisible: false)
+        let phoneOrder = phone.exportDestinationOrder
+        let mac = AppModel(persistence: store, arguments: [], clientPlatform: .mac)
+        XCTAssertEqual(Array(mac.exportDestinationOrder.prefix(7)), [
+            .client(.shadowrocket), .lanSharing, .client(.surgeMac), .client(.clashVerge), .client(.clashMac), .client(.flClash), .client(.mihomoParty)
+        ])
+        mac.moveExportDestination(.client(.clashMac), across: .client(.shadowrocket))
+        // Selecting alone is not saved; it travels with the next real edit.
+        mac.selectTarget(.surgeMac)
+        mac.setClient(.quanx, isVisible: false)
+        let macOrder = mac.exportDestinationOrder
+        let restoredPhone = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        XCTAssertEqual(restoredPhone.exportDestinationOrder, phoneOrder)
+        XCTAssertFalse(restoredPhone.visibleClientTargets.contains(.surgeMac))
+        restoredPhone.selectTarget(.clash)
+        // A phone write must not overwrite the Mac's own selection.
+        restoredPhone.setConfigurationName("Phone write")
+        let restoredMac = AppModel(persistence: store, arguments: [], clientPlatform: .mac)
+        XCTAssertEqual(restoredMac.exportDestinationOrder, macOrder)
+        XCTAssertEqual(restoredMac.selectedTarget, .surgeMac)
+    }
+
+    func testBrowsingClientsIsNotSaved() throws {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent("tower-browse-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        model.setConfigurationName("Saved")
+        let saved = try Data(contentsOf: fileURL)
+        let visible = try XCTUnwrap(model.visibleClientOrder.first { $0 != model.selectedTarget })
+        model.selectTarget(visible)
+        XCTAssertEqual(model.selectedTarget, visible)
+        XCTAssertEqual(try Data(contentsOf: fileURL), saved, "Switching between visible clients must not write")
+    }
+
+    func testFreshExportOrderMatchesProductDefault() {
+        let model = AppModel(
+            persistence: PersistenceStore(
+                fileURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("tower-export-order-default-\(UUID().uuidString).json")
+            ),
+            arguments: [], clientPlatform: .phone
+        )
+
+        XCTAssertEqual(model.exportDestinationOrder, [
+            .client(.shadowrocket),
+            .client(.clash),
+            .lanSharing,
+            .client(.surge),
+            .client(.loon),
+            .client(.quanx),
+            .client(.clashApple),
+            .client(.anywhere),
+            .client(.v2box),
+            .client(.singBox),
+            .client(.hiddify),
+            .client(.egern),
+            .client(.clashMi),
+            .client(.karing),
+        ])
+    }
+
+    func testEveryExportDestinationIdentifierRoundTrips() {
+        let destinations = ClientTarget.allCases.map(ExportDestination.client) + [.lanSharing]
+
+        for destination in destinations {
+            XCTAssertEqual(ExportDestination(identifier: destination.id), destination)
+        }
+        XCTAssertNil(ExportDestination(identifier: "client:not-a-client"))
+        XCTAssertNil(ExportDestination(identifier: "unknown"))
+    }
+
+    func testNormalizationRemovesUnknownsAndDuplicatesThenAppendsNewClients() {
+        let order = ClientTargetOrder.normalized(
+            rawValues: ["quanx", "surge", "unknown", "quanx"]
+        )
+
+        XCTAssertEqual(Array(order.prefix(2)), [.quanx, .surge])
+        XCTAssertEqual(Set(order), Set(ClientTarget.allCases))
+        XCTAssertEqual(order.count, ClientTarget.allCases.count)
+    }
+
+    func testPreviousDefaultOrderMigratesToCurrentDefault() {
+        let existingOrder = [
+            "surge", "clash", "clash-apple", "shadowrocket", "loon", "quanx", "hiddify", "egern", "v2box"
+        ]
+
+        let order = ClientTargetOrder.normalized(rawValues: existingOrder)
+
+        XCTAssertEqual(order, ClientTargetOrder.defaultOrder)
+        XCTAssertEqual(order[8], .singBox)
+    }
+
+    func testFreshAndPreClashOrdersUseCurrentDefault() {
+        let preClashOrder = [
+            "surge", "clash", "shadowrocket", "loon", "quanx", "hiddify", "egern", "v2box"
+        ]
+
+        XCTAssertEqual(ClientTargetOrder.normalized(rawValues: nil), ClientTargetOrder.defaultOrder)
+        XCTAssertEqual(ClientTargetOrder.normalized(rawValues: preClashOrder), ClientTargetOrder.defaultOrder)
+        XCTAssertEqual(ClientTargetOrder.defaultOrder[8], .singBox)
+    }
+
+    func testMissingSingBoxIsInsertedAtCurrentDefaultSlotWithoutReorderingExistingClients() {
+        let customOrder = [
+            "egern", "surge", "quanx", "loon", "shadowrocket", "clash", "hiddify", "v2box", "clash-apple"
+        ]
+
+        let order = ClientTargetOrder.normalized(rawValues: customOrder)
+
+        XCTAssertEqual(order[8], .singBox)
+        XCTAssertEqual(
+            order.filter { $0 != .singBox && $0 != .anywhere }.map(\.rawValue),
+            customOrder + ["clash-mi", "karing", "clash-verge", "clashmac", "flclash", "mihomo-party", "surge-mac"]
+        )
+    }
+
+    func testCurrentExplicitSingBoxPositionIsPreserved() {
+        let customOrder = [
+            "sing-box", "surge", "clash", "shadowrocket", "loon", "quanx", "hiddify", "egern", "v2box", "clash-apple"
+        ]
+
+        XCTAssertEqual(ClientTargetOrder.normalized(rawValues: customOrder).first, .singBox)
+    }
+
+    func testCurrentExplicitClashPositionAfterStashIsPreserved() {
+        let customOrder = [
+            "shadowrocket", "clash", "clash-apple", "surge", "loon",
+            "quanx", "v2box", "sing-box", "hiddify", "egern",
+        ]
+
+        XCTAssertEqual(
+            ClientTargetOrder.normalized(rawValues: customOrder).map(\.rawValue),
+            Array(customOrder.prefix(3)) + ["anywhere"] + Array(customOrder.dropFirst(3)) + ["clash-mi", "karing", "clash-verge", "clashmac", "flclash", "mihomo-party", "surge-mac"]
+        )
+    }
+
+    func testLegacyExplicitSingBoxPositionMigratesToFifthOnce() {
+        let customOrder = [
+            "sing-box", "egern", "surge", "quanx", "loon", "shadowrocket", "clash", "hiddify", "v2box", "clash-apple"
+        ]
+
+        let migrated = ClientTargetOrder.normalized(
+            rawValues: customOrder,
+            savedMigrationVersion: nil
+        )
+
+        XCTAssertEqual(migrated[4], .singBox)
+        XCTAssertEqual(
+            migrated.filter { $0 != .singBox && $0 != .anywhere }.map(\.rawValue),
+            customOrder.filter { $0 != "sing-box" } + ["clash-mi", "karing", "clash-verge", "clashmac", "flclash", "mihomo-party", "surge-mac"]
+        )
+    }
+
+    func testPersistedMigrationVersionKeepsLaterSingBoxDrag() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-client-order-version-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        try store.save(AppSnapshot(
+            subscriptions: [],
+            nodes: [],
+            selectedPresetID: "acl4ssr-online-full",
+            selectedTarget: .surge,
+            clientOrder: [
+                "sing-box", "surge", "clash", "shadowrocket", "loon",
+                "quanx", "hiddify", "egern", "v2box", "clash-apple"
+            ]
+        ))
+
+        let migrated = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        XCTAssertEqual(migrated.clientOrder[4], .singBox)
+
+        migrated.moveClient(.singBox, before: .surge)
+        let reloaded = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        XCTAssertEqual(reloaded.clientOrder.first, .singBox)
+    }
+
+    func testDraggingClientBeforeAnotherPersistsOrder() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-client-order-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        model.moveClient(.egern, before: .surge)
+
+        XCTAssertEqual(Array(model.clientOrder.prefix(4)), [
+            .shadowrocket,
+            .clash,
+            .egern,
+            .surge,
+        ])
+
+        let reloaded = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        XCTAssertEqual(reloaded.clientOrder, model.clientOrder)
+    }
+
+    func testMovingClientInFrontOfItselfDoesNothing() {
+        let model = AppModel(
+            persistence: PersistenceStore(
+                fileURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("tower-client-noop-\(UUID().uuidString).json")
+            ),
+            arguments: [], clientPlatform: .phone
+        )
+        let original = model.clientOrder
+
+        model.moveClient(.surge, before: .surge)
+
+        XCTAssertEqual(model.clientOrder, original)
+    }
+
+    func testLegacySnapshotAddsLANSharingThirdWithoutChangingCustomClientOrder() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-legacy-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let customOrder = [
+            "egern", "surge", "quanx", "loon", "shadowrocket",
+            "clash", "hiddify", "v2box", "clash-apple", "sing-box"
+        ]
+        try store.save(AppSnapshot(
+            subscriptions: [],
+            nodes: [],
+            selectedPresetID: "acl4ssr-online-full",
+            selectedTarget: .surge,
+            clientOrder: customOrder,
+            clientOrderMigrationVersion: ClientTargetOrder.currentMigrationVersion
+        ))
+
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        XCTAssertEqual(model.exportDestinationOrder[2], .lanSharing)
+        XCTAssertEqual(
+            model.clientOrder.map(\.rawValue),
+            Array(customOrder.prefix(9)) + ["anywhere"] + Array(customOrder.dropFirst(9)) + ["clash-mi", "karing", "clash-verge", "clashmac", "flclash", "mihomo-party", "surge-mac"]
+        )
+    }
+
+    func testPreviousOfficialExportOrderMigratesAsOneSequence() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-official-migration-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        try store.save(AppSnapshot(
+            subscriptions: [],
+            nodes: [],
+            selectedPresetID: "acl4ssr-online-full",
+            selectedTarget: .surge,
+            clientOrder: [
+                "surge", "clash", "shadowrocket", "loon", "sing-box",
+                "quanx", "hiddify", "egern", "v2box", "clash-apple",
+            ],
+            clientOrderMigrationVersion: ClientTargetOrder.currentMigrationVersion,
+            lanSharingOrderIndex: ExportDestinationOrder.previousDefaultLANSharingIndex
+        ))
+
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        XCTAssertEqual(model.exportDestinationOrder, [
+            .client(.shadowrocket),
+            .client(.clash),
+            .lanSharing,
+            .client(.surge),
+            .client(.loon),
+            .client(.quanx),
+            .client(.clashApple),
+            .client(.anywhere),
+            .client(.v2box),
+            .client(.singBox),
+            .client(.hiddify),
+            .client(.egern),
+            .client(.clashMi),
+            .client(.karing),
+        ])
+    }
+
+    func testMovingLANSharingToFrontPersistsAcrossReload() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-persist-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        model.moveExportDestination(.lanSharing, before: .client(.shadowrocket))
+
+        XCTAssertEqual(model.exportDestinationOrder.first, .lanSharing)
+        XCTAssertEqual(try XCTUnwrap(store.load()).lanSharingOrderIndex, 0)
+        let reloaded = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        XCTAssertEqual(reloaded.exportDestinationOrder.first, .lanSharing)
+    }
+
+    func testClientAndLANSharingCanMoveAcrossEachOtherAndPersist() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-cross-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        model.moveExportDestination(.client(.loon), before: .lanSharing)
+        XCTAssertEqual(Array(model.exportDestinationOrder[2...4]), [
+            .client(.loon),
+            .lanSharing,
+            .client(.surge),
+        ])
+
+        model.moveExportDestination(.lanSharing, by: -2)
+        XCTAssertEqual(model.exportDestinationOrder[1], .lanSharing)
+
+        let reloaded = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        XCTAssertEqual(reloaded.exportDestinationOrder, model.exportDestinationOrder)
+    }
+
+    func testDragAcrossMovesRightwardAndCanReachLastPlace() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-across-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        model.moveExportDestination(.client(.shadowrocket), across: .client(.clash))
+        XCTAssertEqual(Array(model.exportDestinationOrder.prefix(2)), [
+            .client(.clash),
+            .client(.shadowrocket),
+        ])
+
+        model.moveExportDestination(.lanSharing, across: try XCTUnwrap(model.exportDestinationOrder.last))
+        XCTAssertEqual(model.exportDestinationOrder.last, .lanSharing)
+        XCTAssertEqual(
+            AppModel(persistence: store, arguments: [], clientPlatform: .phone).exportDestinationOrder.last,
+            .lanSharing
+        )
+    }
+
+    func testCompleteDestinationOrderCommitPlacesLastCardInAnExactMiddleSlot() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-exact-slot-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+        let source = ExportDestination.client(.karing)
+        let reordered = ReorderPlanner.moving(
+            model.exportDestinationOrder,
+            identifiedBy: \.id,
+            sourceID: source.id,
+            toInsertionIndex: 1
+        )
+
+        model.setExportDestinationOrder(reordered)
+
+        XCTAssertEqual(model.exportDestinationOrder[0], .client(.shadowrocket))
+        XCTAssertEqual(model.exportDestinationOrder[1], source)
+        XCTAssertEqual(model.exportDestinationOrder[2], .client(.clash))
+        XCTAssertEqual(
+            AppModel(persistence: store, arguments: [], clientPlatform: .phone).exportDestinationOrder,
+            reordered
+        )
+    }
+
+    func testLANSharingIndexIsClampedWhenLoadingDamagedSnapshot() throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tower-export-order-clamp-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = PersistenceStore(fileURL: fileURL)
+        try store.save(AppSnapshot(
+            subscriptions: [],
+            nodes: [],
+            selectedPresetID: "acl4ssr-online-full",
+            selectedTarget: .surge,
+            lanSharingOrderIndex: Int.max
+        ))
+
+        let model = AppModel(persistence: store, arguments: [], clientPlatform: .phone)
+
+        XCTAssertEqual(model.lanSharingOrderIndex, model.visibleClientOrder.count)
+        XCTAssertEqual(model.exportDestinationOrder.last, .lanSharing)
+        XCTAssertEqual(
+            ExportDestinationOrder.normalizedLANSharingIndex(Int.min, clientCount: model.clientOrder.count),
+            0
+        )
+    }
+
+    func testMovingLANSharingInFrontOfItselfDoesNothing() {
+        let model = AppModel(
+            persistence: PersistenceStore(
+                fileURL: FileManager.default.temporaryDirectory
+                    .appendingPathComponent("tower-export-order-noop-\(UUID().uuidString).json")
+            ),
+            arguments: [], clientPlatform: .phone
+        )
+        let original = model.exportDestinationOrder
+
+        model.moveExportDestination(.lanSharing, before: .lanSharing)
+
+        XCTAssertEqual(model.exportDestinationOrder, original)
+    }
+}

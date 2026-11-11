@@ -1,0 +1,323 @@
+# 待办与待验证
+
+## 上游更新待处理（2026-11-09）
+
+来自 `Scripts/check_upstream_updates.py` 的对照，流程见 [UPSTREAM_SOURCES](UPSTREAM_SOURCES.md#维护流程)。已修的见 HANDOFF「按上游更新修正导出」。
+
+### 需要先用新内核或真机验证
+
+- [ ] **Hiddify 5.5**（正式）：内核换成 hiddify 的 sing-box 1.15 fork，塔台注释和文档仍按 1.13。用 hiddify-sing-box `check` 复验整份导出，再逐项决定：放开 VLESS XHTTP、Snell、TrustTunnel；规则集下载从已弃用的 `download_detour` 改为 `http_clients`；评估接上 `SingBoxDNSPolicy`。
+- [ ] **Stash iOS 3.6.5**（正式）：Snell v4/v5、Trojan/VMess REALITY、VLESS REALITY + ws/h2、XHTTP、VLESS Encryption、SSH host-key、MASQUE 复测。**Stash Mac 正式版仍是 4.2**，`.clash` 同时覆盖两端，放开前要么等 Mac 4.3，要么加版本偏好。
+- [ ] **「Clash」App 策略组图标**（1.0.7+ 正式）：2026-11-09 已按更新说明加入 `PolicyGroupIconSupport.drawsIcons`，组名不再带 Emoji（地区组保留国旗）。**待真机确认**图标确实显示；不显示就撤回。
+- [ ] **mihomo 系 `dns.ipv6`**：clash.md 写明默认 false；开 IPv6 时应同时写 `dns: ipv6: true`。
+- [ ] **Stash Tailscale Auth Key 可选**（3.4+ 支持 Web 登录）：改动涉及 CLAUDE.md 第 24 条，先确认。
+- [ ] **mihomo `load-balance` 的 `hash-key`**：导入方案还原时透传。
+
+### 等正式版或文档
+
+- [ ] sing-box 1.15 稳定且 sing-box MT 跟进后：把 `ClientTarget.singBoxSupportsMASQUE` 改为 true；TUN 不再写 `stack`；`certificate_sha256` 放开带证书指纹的节点；实测 HTTP 出站默认 HTTP/2 的回退。
+- [ ] Snell v6 `mode`：现在拒绝非默认值。需要时给 `ProxyNode` 建模并写给 Surge（`mode=`），Clash App / Stash 也有 v6 字段。
+- [ ] Egern 2.21 的 SRC-IP 规则和 Tailscale 代理：等官方文档公开 YAML 字段；Tailscale 按 CLAUDE.md 第 24 条评估。
+- [ ] Karing 1.2.26（目前只在 GitHub 预发布）：上 App Store 后测 mihomo 写法的 Tailscale 和 MASQUE 方言。
+- [ ] Stash TestFlight：`SRC-PORT`、`REJECT-NO-DROP`、StashLink 中继、Tailscale 对等中继。
+- [ ] Surge 策略组 `category`（5.23 / Mac 6.10 正式）：会改变面板分组展示，和第 26 条的 `groupOrder` 一起评估，先问用户。
+- [ ] 新协议（mieru、sudoku、EasyTier、AmneziaWG 等）：目前解析时跳过，属于新功能。
+
+### 只需写进兼容文档
+
+- [ ] Clash Verge / FlClash 的 TUN 以客户端设置为准；Verge / Clash Party 的「DNS 覆写保护」会先弹确认，可能挡掉塔台写的 DNS 段。
+- [ ] Clash App 在 Mac 上也注册了 `flclash://`，同时装两个 App 时给 FlClash 的一键导入可能打开 Clash。
+- [ ] Surge：Snell v6 最低版本（iOS 5.20.0 / Mac 6.7.0，协议仍为 beta）、HTTP/2 CONNECT `udp-relay`、`server-cert-verify-name`。
+- [ ] ClashMac 的 Sparkle 源地址：从安装包 `Info.plist` 读 `SUFeedURL` 后补进清单。
+
+## 策略组图标（2026-10-19，未发布）
+
+- [x] 2026-10-19 国旗提交 `425b0a7` 已推送，清单已绑定，jsDelivr 回读 187 面一致。
+- [ ] App 代码与清单（本地未提交）。
+- [ ] 真机看图标：Surge iOS 策略组卡片、Surge Mac、Stash、Clash Verge、QuanX、Loon、Egern；确认 Loon 策略组的 `img-url`、Surge iOS 的 `icon-url` 实际生效。
+- [ ] FlClash、Clash Party、ClashMac、Clash Mi 是否显示 `icon`；确认显示的加进 `PolicyGroupIconSupport.drawsIcons`。（名为 Clash 的 App 已按更新说明加入，见「上游更新待处理」。）
+- [ ] 导入一份无 Emoji 的方案，确认自动补全的结果和菜单开关。
+
+## 规则集扩展（2026-10-18，未发布）
+
+- [x] 2026-10-18 产物提交 `9da4e71` 已推送，清单已绑定并通过 `--verify-published`（207 个）。
+- [ ] App 代码与清单的第二个提交（等用户同意再提交 / 推送）。
+- [x] 2026-10-18 真机：Loon、Quantumult X、Egern 下载并命中塔台发布的列表；QuanX「自定义策略」顺序正常；规则分流模式下 telegram.org、广告域名、baidu.com、列表外域名分别命中电报信息、全球拦截、全球直连、漏网之鱼，占位策略 `proxy` 已被 `force-policy` 替换。（首次测试全部显示 `proxy`，原因是 QuanX 处在「全部代理」模式；运行模式要长按右下角按钮切换。）
+- [x] 2026-10-18 真机：Surge iOS 的 `[Ruleset]` 和 Stash 的 `type: inline` 规则集加载并命中（「我的规则集」新建无链接规则集测试）。
+- [ ] mihomo 系客户端里 `type: inline` provider 的实际加载与命中（mihomo 1.19.31 `-t` 已通过）。
+- [ ] Hiddify 4.0 真机引用 SRS；sing-box MT 的 DNS 规则引用纯域名 SRS 后，国内外域名的解析服务器与改前一致（本机 sing-box 1.14.2 已能加载全部 61 个规则集）。
+- [x] 2026-10-18 本机实测规则集下载路径：mihomo（按规则）、sing-box MT（`http_client`）、Hiddify（`download_detour`）都经代理；mihomo 的 `proxy:` 已撤回。
+- [ ] 评估把 `tower-geoip-cn`（内置 IP 库展开的约 1.16 万段）也发布成 SRS，需先核对 IP 库许可证。
+
+- [x] 2026-10-01 GitHub 提交前全量复核：正式 Xcode 27.1，1,315 项 XCTest（6 跳过、零失败）及 106 项 Swift Testing 通过；原有实机观感待验证项继续保留。
+
+## 首页添加及分享面板的共用布局（2026-10-01，未发布）
+
+- [x] 补测不同滚动位置的订阅分享、展开节点分享、自有节点分享；记录上一轮仅添加面板验收不足。
+- [x] 共用侧滑层采用单行原生容器，保留左右侧滑、删除确认、尺寸测量及可视区预热，不改业务数据。
+- [x] 同一真机隔离样本、各 3 次：订阅分享松手 73 → 51 ms，自有节点分享 110 → 61 ms，展开节点分享 49 → 44 ms；不是整段动画时长或无掉帧证明。临时测量代码已移除。
+- [x] 真机底部回弹、本地节点删除/菜单、订阅双向侧滑通过，截图核对通过。
+- [x] 系统分享预览头部下拉真机复查通过（17.900 s）。
+- [x] 添加面板带键盘下拉最终真机复查通过（62.689 s）；测试兼容第三方键盘焦点，并处理系统粘贴授权提示；此前失败录屏保留。
+- [x] 全量 1,315 项 XCTest（6 跳过）有 1 项临时端口冲突失败，该项单独复测通过；106 项 Swift Testing 通过。保留首次失败证据。
+- [x] 正式 Xcode 27.1 覆盖安装 1.0.22（60）并正常启动，保留数据，未发布。
+- [ ] 用户实际数据下复测添加、订阅及节点分享的下拉收回观感。
+
+## 首页添加面板下拉收回卡顿（2026-10-01，未发布）
+
+- [x] 用户 345 ms 卡顿日志定位到下拉松手后的 sheet / 首页原生列表集中布局；保留卡片高度，仅挂载可视区及上下各一屏的侧滑 `List`，保留原生双向删除和原有底部回弹结构。
+- [x] 同一真机隔离 1,000 节点样本对照：松手事件平均 362 ms → 55 ms（各 3 次，约降低 85%）；带键盘下拉用例通过。不是整段动画耗时或零掉帧证明。临时探针已移除。
+- [x] 最终源码：1,315 项 XCTest（6 跳过、零失败）及 106 项 Swift Testing 通过。模拟器 11 项中 10 项通过，包含草稿、剪贴板、底部回弹、双向删除和规则页；相关截图已核对。
+- [x] 手动添加键盘测试两次在过早检查 `isHittable` 处失败，随后实际点击及收起断言成功；改为等待按钮可点击后复跑通过（19.230 s）。最终移除探针后的带键盘下拉复查通过（85.038 s）。
+- [x] 正式 Xcode 27.1 覆盖安装 1.0.22（60）及启动成功，保留数据；未发布。
+- [ ] 用户实际数据复测：首页右上角添加 → 下拉收回，核对观感和开发者卡顿检测。
+
+## 用户选定的两处界面调整（2026-09-30，未发布）
+
+- [x] 10-01 文案收短后的 65 项相关测试通过，本地化 1,114 条 PASS；1.0.22（60）已覆盖安装并启动，保留数据。
+- [x] 设置只调整订阅提醒、节点配置、连接的分组；菜单标题按 10-01 要求改回「编辑」，动作缩短为「隐藏 Emoji」/「显示 Emoji」，仍随状态变化。其余已回退的设计改动不恢复。
+- [x] 全量 1,315 项 XCTest（6 跳过、0 失败）与 106 项 Swift Testing 通过；3 项相关 UI 回归、Mac 构建及双向 Emoji 菜单实测通过；本地化 1,113 条 PASS。
+- [x] 通过正式工具链覆盖安装 1.0.22（60），保留数据；首次脚本启动失败后单独启动已确认成功。
+
+## 规则统计在启动同步后再次闪动（2026-09-30）
+
+- [x] 用户确认开启 iCloud，并反馈数字先显示、1–2 秒后再次闪动。上一轮首屏测试不足，不能认为问题关闭。
+- [x] 旧实现复现：同步应用同规则快照会清空已显示的统计；两项模型回归、一项进入后延迟同步 UI 回归先失败。
+- [x] 修改快照应用时的规则缓存失效条件：规则未变不清空、不重算；真规则变更保留旧显示直到新摘要准备完毕，同时导出立即使用最新规则。
+- [x] 隔离修复副本：Mac Catalyst 1,315 项 XCTest（37 跳过、零失败）及 106 项 Swift Testing 通过；iOS 26.5 三项 UI 回归通过，包含延迟同步期间连续 6 秒检查条数与组数存在。系统日志确认同步完成，测试截图核对通过。录屏未可靠覆盖规则界面，不计为逐帧验收。
+- [x] 正式 Xcode 27.1 覆盖安装 iPhone 1.0.22（60）并启动成功；保留数据，未发布。
+- [ ] 用户真实 iCloud 数据实机复测。模拟器使用本地云端替身，不能替代手机实际同步后的观感。
+
+## 规则标签首次进入性能（2026-09-30）
+
+- [x] 将首次卡片所需的规则解析、定制合并和计数移到后台；取消和 revision 校验防止过期结果写回；未添加自定义规则时跳过预览所不需要的全文读取。
+- [x] 移除首轮整页加载指示并稳定卡片布局；用户后续复测仍发现统计行闪动。上一轮几何断言未覆盖「— → 数字」和策略组数量更正，不能据此宣称首次进入无闪烁。
+- [x] 新增回归已在旧实现复现首次可见仍带占位数字；改为根页面后台预热、统计就绪后进入规则，合并重复准备任务，并在改选其他标签时取消待进入操作。
+- [x] 本轮隔离副本回归：旧实现首次真实统计断言先失败；修正后 iOS 26.5 两项 UI 测试通过（首次显示已有真实条数、无占位，返回与编辑正常），截图核对 3,529 条、11 组。Mac Catalyst 全量 1,313 项 XCTest（37 项平台/环境跳过、零失败）和 106 项 Swift Testing 通过，覆盖待进入取消和一次共享准备。
+- [x] 本轮统计首帧修复副本已用正式 Xcode 27.1 和安装脚本覆盖安装 iPhone 1.0.22（60）；安装与启动均成功，保留数据，未发布。
+- [x] 上一轮布局修复的隔离副本全量通过：1,311 项 XCTest（7 跳过、零失败）、106 项 Swift Testing 和 2 项 UI 回归（包括顶部统计横向位置稳定）。最新独立修复包已覆盖安装并启动 iPhone。隔离了同期进行中的设计改动与共享模拟器重装干扰；结果不代表变化中的完整工作区。
+- [x] 十万条规则模拟器用例：同步卡片数据路径由约 130.69 ms 降至准备完成后的 0.10–0.16 ms，验证准备期间主线程可响应。不是手机整页耗时或帧率证据。
+- [x] TowerTests：1,311 项 XCTest（6 跳过、零失败）及 106 项 Swift Testing 通过；取消、过期结果、规则优先级、分组计数均有覆盖。冷启动进入规则、切走再返回及打开编辑，与编辑中移除目录条目的 2 项 UI 回归通过；截图核对通过。
+- [x] 正式 Xcode 27.1 构建，覆盖安装 iPhone 1.0.22（60）并成功启动，保留用户数据；未发布。
+- [ ] 用户真实数据实机复测最新防闪烁包：划掉 App → 重开 → 立即点击底部「规则」，重复两三次，观察首次进入是否闪烁及已开启的卡顿检测。仍有长卡顿时采集对应的主线程堆栈继续定位，不以模拟器耗时代替实机结论。
+
+## Mac mini M2 实测记录（2026-09-29，进行中）
+
+环境：Mac mini M2，macOS 26.3.1(a)，塔台 1.0.21 (59) Debug Catalyst；本轮使用与当前工作区一致的源码构建。通过屏幕共享实际操作；配置文件检查、导入、启动和实际连接分别记录。
+
+| 项目 | 实际结果 | 尚待验证 |
+| --- | --- | --- |
+| 测试订阅导入 | UI 成功添加，25 个节点；原始 26 条 URI 中的 `naive+https` 未进入节点列表。其余为 VLESS 9、VMess 5、SS 4、Hysteria2 4、Trojan 3。 | Naive 输入的产品支持边界；各客户端连接结果。 |
+| ACL4SSR 全分组 → SFM 1.14.2 | 塔台一键导出成功唤起 SFM，确认导入后产生 968,630 字节完整 JSON；23 个兼容节点、2 个跳过。奈飞 selector 首项为「🚀 节点选择」，两个出站保留 uTLS。 | 系统网络扩展已获用户确认并启用；启动、内存、DNS、规则命中与连接未验收。Mac SFM 结果不等同于 iOS sing-box MT。 |
+| 远程 DNS 设置（M2 UI） | 旧方案预填 `8.8.8.8` / `1.1.1.1`；删空后保存出现「请至少保留一个远程 DNS 服务器」；保存 `8.8.8.8` 后重新一键导入 SFM，实际 `config_2.json` 的 `remote` 为 HTTPS `8.8.8.8:443`、detour 为「🚀 手动切换」。三项通过。 | 实际 DNS 请求与分流仍需启动客户端验证。 |
+| FlClash 0.8.98 手动文件导入 | 完整 YAML 在配置页添加成功并加载：25 节点、29 组、10,410 条规则；实际配置保留 `#🚀 手动切换&ecs=…` 及 `direct-nameserver`。UI 延迟测试全部节点有成功延迟（约 71–158 ms），44 XHTTP 为 127 ms、53 Encryption 为 74 ms；「奈飞视频」默认选中「🚀 节点选择」。 | SSH 经应用实际监听端口请求：gstatic 204、国内/国外站 200；连接页证实 `8.8.8.8:443` 经手动组、国内站 `GeoIP(cn)` → DIRECT、国外站经漏网之鱼 → 节点选择。测试后已停止代理。仅一键导入仍误唤起其他 Clash。 |
+| Clash Mi 1.0.30 (1605) / 官方 Tailscale | 塔台生成的完整 YAML 手动文件导入成功；扩展启用后 UI 显示已连接，实际核心为 mihomo 1.19.31。经应用的 loopback 代理访问 M4，Tailscale IP 与 MagicDNS 均首次成功返回预期正文及 HTTP 200（约 2.865 s / 35 ms）；应用实际核心 delay API 的 HTTPS 测试 25/25 成功，包括 44 XHTTP 和 53 Encryption。 | 本轮 TUN 关闭，仅验证应用实际代理服务；家里子网与重启身份复用仍待验证。首次授权后曾出现启动超时，重新连接后成功。 |
+| Clash Mi / ACL4SSR 标准保护 | UI 导入并连接完整配置，实际加载 25 节点、10,410 条规则；「奈飞视频」默认选「🚀 节点选择」。关闭客户端 DNS 覆写并重连后，实际配置保留塔台的 ECS DoH 与 direct-nameserver；日志证实 8.8.8.8:443 经手动组，国内站命中 GeoIP → 全球直连 → DIRECT（200），国外站走漏网之鱼 → 节点选择（200），gstatic 返回 204。扩展 RSS 单次快照 70,256 KiB。 | TUN 关闭，经应用实际 loopback 代理验收；严格保护与系统接管另测。客户端默认开启 DNS 覆写，直接导入会替换塔台 DNS，必须区分。 |
+| 客户端准备 | 新装官方 Clash Mi 1.0.30 (1605)、FlClash 0.8.98、Hiddify 4.1.1、SFM 1.14.2，下载包 SHA-256 与官方发布资产一致。 | 安装完成不代表兼容性通过，继续逐项实测。 |
+
+### 独立内核实测（不能替代客户端 UI / 网络扩展验收）
+
+在 M2 上运行；保留塔台导出的节点、DNS 和完整 ACL4SSR 规则，仅把入口改为 `127.0.0.1` 的独立 mixed 端口，隔离控制端口及缓存，不开启系统代理或 TUN。每个节点通过内核 delay API 实际请求 HTTPS `generate_204`，不是只测 TCP 端口；结束后测试进程均退出。
+
+| 内核 / 输入 | 结果 | 限制或发现 |
+| --- | --- | --- |
+| sing-box 1.14.2 / SFM 实际收到的 JSON | 两份完整 JSON 均 `check` 退出 0；含 11,605 条国内 CIDR 的配置成功启动；23/23 个可导出节点请求成功。含 uTLS 的 VLESS Reality + gRPC、Trojan Reality 分别为 303 / 166 ms。 | 44 XHTTP、53 VLESS Encryption 不在本目标可导出节点内；不能将 CLI 结果写成 SFM 网络扩展、iOS MT 或其他客户端通过。 |
+| sing-box 标准 DNS / 8.8.8.8 | 日志证实 DNS 的 `8.8.8.8:443` 经测试节点发出；`www.volcengine.com` 解析得到国内地址、命中 `tower-geoip-cn` 并由 `DIRECT` 连接，HTTP 200；`example.com` 走代理、HTTP 200；gstatic 返回 204。 | 单次运行 RSS 72,256 KiB（约 70.6 MiB）；不是峰值或长期内存泄漏测试。 |
+| Mihomo Party 1.5.12 自带 mihomo 1.18.10 / 本轮生成的完整 YAML | `#🚀 手动切换&ecs=114.114.114.0/24&ecs-override=true` 被接受；完整配置校验及启动通过；23/25 节点成功。 | 44 VLESS Reality XHTTP、53 VLESS Encryption 返回 delay API 503。初次 GeoIP 数据下载超时；提供本地 Country.mmdb 后校验通过，需与配置语法失败区分。 |
+| 同一 YAML / mihomo 1.19.31 | 25/25 节点成功，包括上述 44 和 53；国内测试站 200、gstatic 204、国外测试站 200。 | 单独运行新内核作为版本对照，没有据此宣称已升级或验收 Mihomo Party UI。 |
+| mihomo 标准保护 | 输出无 `fallback`、有 `direct-nameserver`，最终 GEOIP 不带 `no-resolve`；1.18.10 日志证实 8.8.8.8 经节点请求、国内站命中 `GeoIP(cn)` → `DIRECT`、国外站命中兜底代理。节点域名及国内直连的 DNS 解析成功。 | FlClash 与 Clash Mi 实际加载、标准保护分流已通过；严格保护模式仍待继续。 |
+| mihomo 1.19.31 严格保护 | M2 塔台 UI 切换严格保护并分享得到完整 FlClash 目标 YAML：25 节点、10,410 条规则，无 `fallback` / `direct-nameserver`。隔离 CLI 运行后 25/25 节点 HTTPS 请求成功；国内站 200、国外站 200、gstatic 204。日志证实 8.8.8.8:443 经手动组，国内站 GeoIP(cn) → DIRECT、国外站兜底代理。RSS 单次快照 53,888 KiB。 | CLI 测试关闭 TUN，结束后进程已退出；Clash Mi UI 已显示此文件「添加成功」，但受远程点击被识别为长按影响，尚未完成选用与连接，不算 Clash Mi 严格保护通过。 |
+| 本轮私密订阅生成回归 | `LocalCompatibilityCorpusTests` 在 iPhone 17 / iOS 26.1 模拟器通过（1 项、0 失败），生成各目标客户端的节点及完整配置。 | 只作为当前源码生成证据，不替代客户端兼容性测试。 |
+
+### 实测发现与继续条件
+
+- **FlClash 一键导出误唤起**：M2 已安装 FlClash 0.8.98 和 Clash 1.0.12；在塔台选 FlClash 并点击一键导出，实际出现 Clash 的添加配置确认框。首次启动完成后再次复测仍误唤起 Clash，两次均取消；需继续核对 macOS URL Scheme 路由，不能标为 FlClash 一键导入通过。
+- **FlClash 首次启动**：先前出现免责声明；12:28 恢复屏幕操作后弹窗已消失，可进入仪表盘及配置页。
+- **SFM 网络扩展**：导入已完成，用户确认后，SFM 与 Clash Mi 网络扩展均为 `activated enabled`；这只证明扩展已启用，尚不代表 TUN / 系统流量验收通过。
+- **屏幕控制恢复**：11:53 后曾因本机锁定中断；12:28 已恢复操作。中断期间补做 SSH 独立内核测试，继续 Hiddify DNS、Clash Mi / FlClash / Loon / Egern / Shadowrocket / QuanX 的剩余 UI、规则命中及往返测试。
+- **样本与设备边界**：本次订阅没有 AnyTLS，不能覆盖 Anywhere 的 AnyTLS 逐原因提示；没有反馈者原始 VMess 复制片段，不能关闭该项。官方 Tailscale Key 已由用户提供，M4 已在线并启动私有测试服务，M2 验证进行中；子网审批、受控 iCloud 第二设备、iPhone Instruments / 真机触摸 / VoiceOver 另需相应环境。既有明确暂缓事项不据本轮核心测速结果解除。
+
+本轮私密输入、客户端配置与详细本地证据保存在被 Git 忽略的 `.artifacts/todo-m2-20260929/`；不在本文记录订阅地址、节点凭据或设备标识。
+
+## 首页底部回弹（2026-09-30，用户真机复测通过）
+
+- **真机验收**：最终版本覆盖安装后，用户复测反馈「可以了」，本次首页底部回弹不自然的问题关闭；该确认不代表更大节点规模的启动与内存性能已完成量测。
+- **用户录屏补充**：第一轮优化后仍有异常；60 fps 录屏中，回弹中段约停住 0.12 秒，随后一次跳过约 26 pt。CPU 降低和最终落点正确均不能据此认定回弹流畅。
+- **本轮调整**：首页外层改为普通 `VStack`，让卡片布局在滚动与回弹期间保持存在，避免外层懒加载反复创建/回收包含原生 `List` 的卡片；订阅展开后的节点列表继续懒加载。保持系统回弹参数、双向侧滑删除、长按菜单、展开、勾选及间距。
+- **已撤回的对照**：尝试 iOS 27 的容器侧滑接口，回弹测试通过，但自有节点和订阅横滑后未出现删除按钮；两种接口写法均未通过，已完整撤回，不能把缺少删除交互的结果作为性能验收。
+- **最终基础验证**：iOS 27 模拟器的底部回弹、自有节点删除、订阅双向删除 3 项 UI 测试全部通过（覆盖长按、展开、取消和确认）；MotionDesign / RepositoryConsistency 58 项通过。录屏抽帧未再观察到用户视频中的中途停顿再跳位；落点断言只能保证最终位置，不能替代真机动画验收。
+- **性能取舍**：外层普通栈会提前准备更多卡片；第一轮对照的自动化 CPU 比懒加载更高，因此本轮不宣称整体性能或启动速度提升，优先验证回弹连续性。更多自有节点规模下的启动与内存成本仍需单独量测。
+- **安装**：正式版 Xcode 27.1 构建的最终 1.0.22（60）已重新覆盖安装并启动实体 iPhone，保留原有数据，没有升级版本或发布；测试用 iOS 27 模拟器已清理。
+- **验证边界**：真机 UI runner 此前在建立连接前退出（code 74），没有执行手势；本轮不重复尝试相同阻塞。真机自然度以用户手动复测确认为依据，与模拟器录屏、自动化测试及安装结果分别记录。证据仅保留在被忽略的 `.artifacts/home-bottom-bounce/`。
+
+以下为 **9 月 30 日第一轮对照**，已被用户录屏证明不足以解决问题：
+
+- 自有节点曾改为首页外层 `LazyVStack` 的逐行子项。iOS 26.5 模拟器中，新增的底部回弹落点用例和自有节点删除回归通过，MotionDesign / RepositoryConsistency 58 项通过。
+- 同一自动化流程三轮均值：CPU 指令 30.407M → 16.333M kI，CPU 时间 3.246 → 2.120 秒。包含 XCTest 手势和辅助功能查询开销，不能表示单次回弹延迟或真机帧率。普通 `VStack` 对照的流程 CPU 更高；后续以用户实际运动轨迹为依据重新验证这一取舍，不能将该降幅用于最终方案。
+- 第一轮 1.0.22（60）曾覆盖安装并启动实体 iPhone，保留数据；用户随后录屏反馈回弹仍不自然。
+
+以下为 **9 月 29 日历史记录**，其中的对照没有覆盖本轮改动：
+
+- 用户反馈：滑到首页底部时回弹「有点卡顿，不流畅」。已把「订阅」「自有节点」两个内层 `LazyVStack` 改回 `VStack`，用户说仍然不流畅。
+- **主要嫌疑**：自有节点卡片的 `CardSwipeDeletion`。每张卡片渲染两遍（隐藏的测量副本加一份原生 `List`），而内层改成 `VStack` 后，滑到底部附近时这些 `List` 会一次性全部创建。
+- **真机对照**：iPhone，1000 节点测试数据，其中 40 个自有节点；先滚到自有节点区，再上下滑，各 5 轮。
+  - 带滑动删除：每轮 CPU 指令 25.0M kI，CPU 时间 6.47 秒。
+  - 不带：13.1M kI（少 48%），5.14 秒。
+  - 两者帧率都约 83.7 fps，XCTHitchMetric 都记为 0 次卡顿。
+  - 这组测的是卡片已创建好之后的滚动，没有覆盖「第一次滑到底、卡片一次性创建」那一刻。按用户要求中断，没有测完。
+- **下一步**：从顶部冷启动、一路滑到底再回弹，对比带和不带滑动删除（测试写法见本次记录，未提交）。如果确认是它，可选方案：
+  - 首页卡片去掉滑动删除，删除保留在长按菜单和管理页。
+  - 自有节点区改用一个共享的 `List`。
+
+## GitHub Issues 状态（2026-11-11 核对）
+
+2026-11-11 已回复并关闭：#51（Anywhere 一键导入改发 AJSON，真机通过，未发布）、#49、#50、#22（1.0.31 修复）、#45（1.0.30 上线）、#48（已有内置 Tailscale 写法，`[Proxy]` 不随方案保存）、#11（不计划支持 iOS 16）。更早关闭的见 git 历史。
+
+**部分完成**
+- [#31](https://github.com/pengchujin/tower/issues/31) Self-Configuration 的地区组匹配不到节点：它是导入方案，地区组按节点名正则匹配。节点详情里的「手动地区」只影响界面和内置预设的 IP 库分组，不影响名字正则。报告者想要的「重命名覆写 / 手动归类」还没做。
+- [#13](https://github.com/pengchujin/tower/issues/13) 代理链：策略组已有「中继（relay）」类型；节点级前置代理（mihomo `dialer-proxy`、Surge `underlying-proxy`）还没有。
+
+**未做（功能建议）**
+- [#52](https://github.com/pengchujin/tower/issues/52) 「添加网站」增加 GEOIP、IP-ASN、SRC-IP-CIDR、PROTOCOL、AND/OR/NOT：要按 `RoutingRuleCapabilities` 逐客户端处理。
+- [#53](https://github.com/pengchujin/tower/issues/53) DNS 保护模式说明，导出预览显示解析链路及对代理策略组的依赖。
+- [#54](https://github.com/pengchujin/tower/issues/54) 规则方案菜单直接导出 INI 文件 / 系统分享。
+- [#55](https://github.com/pengchujin/tower/issues/55) 支持 Pharos Pro：需先调研它的配置格式与导入方式。
+- [#35](https://github.com/pengchujin/tower/issues/35) 测速后自动剔除或隐藏超时节点：需要设计连续失败阈值、刷新后沿用、一键恢复。
+- [#16](https://github.com/pengchujin/tower/issues/16) Base Profile / 原样保留模式：很大的功能，需要单独设计。
+
+## DNS：待真机验证与后续（2026-09-29）
+
+- **Hiddify**：按 hiddify-core `main` 分支源码（`v2/config/builder.go` 的 `BuildConfig` / `setOutbounds` / `setRoutingOptions`，`dns.go` 的 `setDns`）：
+  - Hiddify 只保留导入配置里的单个节点，`selector` / `urltest` 策略组、route 规则和 DNS 都会被它自己的设置替换。即使开了 `enable-full-config`，后面也照样整段覆盖。
+  - 分流由它的「地区」选项决定，比如选中国就用 geosite-cn / geoip-cn 直连；DNS 用它的「远程 DNS / 直连 DNS」。
+  - 也就是说，塔台给 Hiddify 生成的策略组、ACL4SSR 规则和 DNS 都不生效，给它套 `SingBoxDNSPolicy` 没有意义。
+  - **待决定**：先在 M2 上导入一次，确认 4.1.1 确实如此。确认后，Hiddify 目标改为只导出节点，并在导出页提示在 Hiddify 里把「地区」设为中国。
+
+## Codex 审查修复：待真机验证（2026-09-29）
+
+- **Loon**：确认 `AND,((DOMAIN-SUFFIX,x),(NOT,((DOMAIN,x)))),REJECT` 能导入，而且只拦子域名、不拦 x 本身。
+- **Clash Mi**：用一份每个组都带 DIRECT 的方案，确认隐藏的「DNS 自动选择」组不在界面上显示，DNS 经它走代理。
+
+## 规则优先级（issue #40 后续，2026-09-29）
+
+- **真机**：
+  - 在拖动过策略组的手机上升级，应当看到一次「规则匹配顺序已恢复…」提示。
+  - 导出后，`openai.com` 应当先命中「💬 Ai平台」。
+- 「让某个网站走某个组」已由 issue #45 的「我添加的规则」解决（永远最先匹配）。不做拖动改优先级：列表要和客户端面板顺序一致，见 CLAUDE.md 第 26 条。
+
+## 策略组详情与补充规则（issue #45，2026-10-14）：待真机验证
+
+- 规则定制列表、规则首页「查看策略组」、导出到 Stash 后的策略组面板，三处顺序一致；拖动后三处一起变，规则匹配顺序不变。
+- 策略组详情里直接改名称、策略类型、候选顺序，返回后再进入仍是新值，导出生效。
+- 规则列表查看页按类型筛选、搜索正常。
+- 在「💬 Ai平台」添加新网站后导出，该域名排在所有规则最前，客户端里确实走 Ai平台；刷新方案、iCloud 同步后仍在。
+- Mac 版：拖动、详情页滚动和返回正常。
+
+## 节点与策略组：待真机验证（2026-09-29）
+
+- **Anywhere**：导出页「已跳过」列表里，每个 AnyTLS 节点现在会显示具体原因。如果原因是「跳过证书校验」，说明订阅本身要求不校验证书，Anywhere 做不到；如果是某个指纹，把名字告诉开发者。
+- **ACL4SSR 全分组（订阅里没有奈飞节点时）**：「🎥 奈飞视频」的默认选项应当是「🚀 节点选择」，不再是直连。
+- **sing-box MT**：带 `client-fingerprint` 的节点能正常连接（现在会写 uTLS）。
+- **QuanX**：VLESS HTTP 伪装节点能导入、能连接。
+- **Egern**：VLESS Reality + gRPC 节点能导入、能连接。这是按文档新放开的组合，之前没有做过真机验证。
+- **Loon**：带指纹的 Reality 节点（`tls-profile`）能正常连接。
+
+## 规则导入：待真机验证（2026-09-28）
+
+真实配置测试发现的问题已全部修复，见 [RULE_EXPORT_AUDIT](RULE_EXPORT_AUDIT.md#导入这一侧真实配置测试2026-09-28-晚)。需要在手机上确认：
+
+- **666OS / qichiyuhub 这类 MRS 配置**：导入后导出到 Clash Mi（mihomo 内核），配置能加载，规则集能下载并生效；导出到其他客户端时，兼容性提示里是按规则集列出的「无法读取 MRS 规则集」，不再是几千条乱码。
+- **带 `clash-classic:` 的第三方 `.ini`**：能导入，blackmatrix7 规则集的规则都在。
+- **Surge 配置导出到其他客户端**：兼容性提示第一条是「N 条拦截规则…已跳过」，配置能正常导入。
+- **带 `encrypted-dns-server = h3://…` 的 Surge 配置**：导出到 Clash Mi 能加载（`#h3=true`），导出到 sing-box MT 时 DNS 可用。
+
+## 分流规则导出：待真机验证（2026-09-28）
+
+审计发现的问题都已修复，见 [RULE_EXPORT_AUDIT](RULE_EXPORT_AUDIT.md) 和 [HANDOFF](HANDOFF.md#未发布分流规则导出审计修复2026-09-28)。下面这些只能在真机或客户端里确认：
+
+- **Loon**
+  - 导入 ACL4SSR 全分组的完整配置，确认 8 个地区组不再报错、能正常测速。
+  - 用一份带屏蔽 QUIC 规则的 Surge 配置，确认 `AND,((PROTOCOL,UDP),(DEST-PORT,443)),REJECT` 生效。
+  - 确认 `REJECT-IMG` 可用。
+  - 打开远程规则集后，ACL4SSR 会全部内联：看配置能否正常加载，以及加载速度。
+- **Shadowrocket**
+  - 确认 YAML 导入能识别写在策略名后面的 `pre-matching` / `extended-matching`、`REJECT-NO-DROP` / `REJECT-TINYGIF`、`AND,((PROTOCOL,UDP),(DST-PORT,443)),…`。
+  - 远程模式的 `rule-providers` 写法仍然没有验收过。
+- **QuanX**
+  - 确认 `REJECT-TINYGIF` 换成 `REJECT` 后能正常导入。第一版写成了 `reject-img`，QuanX 报「未知策略或节点」，已修正。
+  - 确认保留 `filter_remote` 时，远程列表的域名规则能命中（此时不再写 `host-keyword, .` 兜底）。
+- **Egern**
+  - 确认 `ip_cidr6`、`asn`、`domain_wildcard`、`user_agent`，以及 `and` / `not` 嵌套写法能被接受并命中。
+- **sing-box MT / Hiddify**
+  - ACL4SSR 全分组的配置现在约 0.9 MB，其中 `GEOIP,CN` 展开成约 1.16 万条 CIDR。确认导入、启动和内存都正常，国内 IP 能直连。Hiddify 的内核版本可能比官方 1.14 旧。
+- **iCloud 第二台设备**
+  - 方案同步过来、规则列表还没下载时，导出应提示「部分规则还没下载完成 · 刷新规则」并阻止导出；点「刷新规则」后应能正常导出。
+- **可能要按实测放宽的**：Loon / Shadowrocket 的 `PROCESS-NAME`、`DOMAIN-WILDCARD`（Loon）、`SRC-IP`、`SUBNET`，以及 Stash 的 `SRC-PORT` / `IN-PORT`。这些现在都按文档跳过并提示；如果客户端实测接受，再加回白名单。
+
+## Shadowrocket 批量复制的 VMess WebSocket Host 异常（2026-09-24 邮件反馈）
+
+- 旧式 VMess URI 里 `obfsParam` 为 JSON 时原样落入 Host 的分支已于 2026-09-25 修复（`LegacyVMessTests`）。
+- 仍待：拿到反馈者脱敏后的原始复制片段，确认是不是同一个原因，并做一次 Shadowrocket 真机往返。不要收集真实订阅链接或节点凭据。
+- 反馈者另表示有多项规则调整建议，但邮件没有具体规则与预期结果；待取得脱敏示例后逐项记录。
+
+## Tailscale：剩余验收
+
+- 已实现，见 [HANDOFF](HANDOFF.md#未发布tailscale-内网2026-09-28)。
+  - 自建 Headscale：Surge、Stash 3.4、Clash Mi、sing-box MT 实测通过。
+  - 官方 Tailscale 账户：Surge（交互登录）和 Stash（Auth Key）实测通过。
+- 本轮补充（2026-09-29）：官方 sing-box 1.14.2 在 M2 上加载塔台生成的完整 Tailscale 配置，仅以 loopback mixed 入口替换 TUN；通过 Tailscale IP / MagicDNS 分别读到 M4 私有服务的预期内容，均 HTTP 200（首次请求约 609 / 88 ms）。RSS 单次快照 77,008 KiB，结束后独立内核已退出。此结果属于 CLI，不替代 SFM / iOS MT 图形客户端验收。
+- 待验收：
+  - Clash Mi 官方账户的设备 IP / MagicDNS 访问已于本轮通过（见上表）；重启身份复用和子网访问仍待验收。
+  - sing-box MT 图形客户端官方账户验收仍待完成；本轮 CLI 结果不能替代。
+  - 官方账户下访问家里子网尚未单独验证。子网路由需要在管理后台批准。
+- 未做：
+  - 出口节点（`exit-node`）。
+  - Shadowrocket 的格式：Clash YAML 和 Surge 写法都没有向控制服务器注册，官方也没有公开字段，不要猜。
+  - Hiddify、Karing 等：等它们正式发布 Tailscale 出站后再评估。
+- Stash 以后如果能在客户端里登录（OAuth 上线），可以改成和 Surge 一样：不写 Key，改走交互登录。改之前要先实测确认：
+  - 能登录。
+  - 重复导入仍然是同一台设备。
+- **不做**：
+  - 塔台代用户登录 Tailscale、自动获取或生成 Auth Key。2026-09-28 已评估，原因见 [TAILSCALE](TAILSCALE.md#为什么塔台不能自动获取-auth-key)。塔台不代用户生成 Key，也不修改用户账户。
+  - 不要把 Auth Key 写给 Surge。Surge 按 Key 的哈希保存身份，写了就会多注册一台设备，也不要为了「只用一次」在导出后删除 Key。
+
+研究入口：[Surge](https://manual.nssurge.com/policies/tailscale.html)、[Stash](https://stash.wiki/en/proxy-protocols/proxy-types#tailscale)、[Mihomo](https://wiki.metacubex.one/en/config/proxies/tailscale/)、[sing-box](https://sing-box.sagernet.org/configuration/endpoint/tailscale/)、[Auth Key 安全](https://tailscale.com/docs/features/access-control/auth-keys/how-to/secure-auth-keys)、[OAuth apps](https://tailscale.com/docs/features/oauth-apps)。
+
+## Stash 3.4：兼容性暂缓
+
+2026-09-06 用户确认目前使用 3.4，并反馈当前最新可用版本仍是 3.4；要求先写文档、等待后续版本。维持现有跳过策略，暂不继续修改实现。
+
+- 待用户恢复此项工作或取得新版本后，先核对实际版本和官方能力。Snell v4/v5、Trojan Reality、VLESS XHTTP 的文档门槛为 iOS 3.6+，不能按文档提前假定已可使用。
+- 核实 AnyTLS / SOCKS5 / HTTP Reality 是否被 Stash 接受。旧导出确实丢失 Reality 参数，但这不证明客户端不支持；确认支持后补齐参数，逐节点完成导入、握手及实际请求验证。
+- 独立核对原生 SS-over-TLS；不要以已支持 SS 的 WebSocket TLS 插件推断支持原生 TLS。
+- 恢复支持时覆盖版本差异和所有导出入口，保留明确的跳过提示；不改写源节点，不将 Reality 静默变成普通 TLS。
+- 当前跳过节点清单、已通过客户端反馈及测试/安装记录见 [HANDOFF](HANDOFF.md#stash-34暂缓扩展等待后续版本2026-09-06)。
+
+## Loon 剩余节点待定位（暂缓）
+
+- 2026-09-06 用户要求先记文档、转查 Surge，暂停继续试改 Loon。07、08、01、02 已修好，见 HANDOFF。
+- Loon 3.5.0：09、10、11、13 仍失败。13 日志为 QUIC 握手超时且 UDP 收包数为 0，需进一步区分网络/服务端/客户端原因；09 需原始 Reality 参数，不能从其他节点复制公钥。
+- 区分漏字段、客户端协议能力和服务端/网络故障。不要仅凭测速失败判定“不支持”并跳过；仅有协议名也不表示完整 TLS / Reality 组合可用。
+
+## Surge 原生 SS TLS 与版本差异（暂记）
+
+- 11 原生 SS TLS 源语义被旧导出丢失；补 `tls=true` / `sni` 后手机仍失败，暂不继续猜字段或替换成 simple-obfs / ShadowTLS。
+- 核对明确支持该组合的官方说明或获得运行时握手证据后再决定补齐或跳过。电脑当前是 Mac 6.4.4 (10661)，不能用其检查结果推断更新版本或 iOS 5.21.1 的能力。
+- 用户提供的后续版本日志包含 ALPN、ECN、TLS 和 QUIC 修复，没有明确的 SS 原生 TLS 新增声明。若后续在新版电脑验证，先确认版本，隔离测试配置，不影响用户当前代理。
+- 13/14 换网络后已恢复；仍需区分网络问题与 ECN 设置的独立影响，不因之前失败过滤 Hysteria2 / TUIC。
+
+## 等待样本或客户端验证
+
+- VMess 名称回退：等用户提供脱敏样本后再改；核对原始返回体、UA 差异及 ps / remarks，不先覆盖服务商原名。
+- Surge TLS 失败：需要脱敏错误和对应节点；检查原始 TLS 字段及客户端支持，不以全局关闭证书校验“修复”。
+- 订阅 UA 回退 / 兼容格式：确认返回的节点数量和协议没有丢失；配额补请求只读响应头，不能替换原订阅节点正文。
+- 同 URL 重复导入：按客户端分别确认覆盖/新增/内部刷新行为。原始订阅嵌入不代表塔台规则和自有节点也会自动更新。
+- 代理集合：官方稳定版客户端逐一实测远端格式、策略组动态成员、UA 和下载失败行为；sing-box 社区 provider 示例只能作为研究线索。
+- Shadowrocket 的 Salamander 参数、局域网多网卡/路由器场景保留客户端实测，不据生成成功宣称连通。
+
+## 后续评估
+
+- YAML 导出文件命名（2026-09-14 用户建议，待实现）：采用 `塔台-订阅备注-YYYYMMDD-HHmm.yaml`，例如 `塔台-美国节点-20260914-1418.yaml`，便于区分订阅、导出时间及备份恢复；对订阅备注中的文件名非法字符自动做安全处理。实施前明确多订阅合并导出、备注为空及同一分钟重复导出的命名规则，并验证保存与分享后的实际文件名。
+- iOS 16 兼容尚未开始，当前最低仍是 iOS 17；需要单独确认收益和替代交互，不降低现有功能质量。
+- 真机 Instruments：2026-09-27 已录制三轮并修复（iCloud 合并移出主线程、离屏渲染、规则缓存不再每次保存清空，见 HANDOFF）。还差规则缓存修复之后的一次对比录制，最好用 Release 构建。
+- [开发清单](DEVELOPMENT.md)中的真机触摸、VoiceOver、权限和分享回归不能由单元测试替代。

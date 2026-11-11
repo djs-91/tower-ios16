@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.icloud-container-identifiers</key>
+	<array>
+		<string>iCloud.com.jzb.tower</string>
+	</array>
+	<key>com.apple.developer.icloud-services</key>
+	<array>
+		<string>CloudDocuments</string>
+	</array>
+	<key>com.apple.developer.ubiquity-container-identifiers</key>
+	<array>
+		<string>iCloud.com.jzb.tower</string>
+	</array>
+	<!-- App Sandbox keys do nothing on iOS, where every app is sandboxed by the
+	     system regardless. This one is here for the same binary running on an
+	     Apple silicon Mac as a "Designed for iPhone" app: there the macOS
+	     sandbox applies, and accepting an incoming connection — which is the
+	     whole of LAN subscription — is denied without it. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+</dict>
+</plist>

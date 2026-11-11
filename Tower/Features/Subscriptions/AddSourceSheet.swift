@@ -1,0 +1,931 @@
+import SwiftUI
+import UIKit
+
+struct AddSourceSheet: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    private let editingNode: ProxyNode?
+    @State private var name = ""
+    @State private var sourceValue = ""
+    @State private var isSaving = false
+    @State private var requestsDiscard = false
+    @State private var initialSourceValue = ""
+    @State private var scanGeneration = UUID()
+    @State private var errorMessage: String?
+    @State private var didReadPasteboard = false
+    @State private var clipboardProgress: Progress?
+    @State private var clipboardGeneration = UUID()
+    @State private var entryMode: EntryMode = .paste
+    @State private var manualDraft = ManualNodeDraft()
+    @State private var customUserAgent = ""
+    @State private var dnsOverHTTPSURL = ""
+    /// Held so 取消 can actually stop the request.
+    ///
+    /// A fetch runs for up to 30 seconds per compatibility attempt, and the
+    /// task used to be unstructured and unowned: dismissing the sheet left it
+    /// running, so cancelling an add still added the subscription and still
+    /// announced it in a toast some seconds later.
+    @State private var saveTask: Task<Void, Never>?
+    @FocusState private var focusedField: Field?
+
+    private let detector = SourceInputDetector()
+
+    private enum Field: Hashable {
+        case manual(String)
+        case name
+        case source
+    }
+
+    private enum EntryMode: String, CaseIterable, Identifiable {
+        case paste
+        case scan
+        case manual
+
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .paste: String(localized: "粘贴识别")
+            case .scan: String(localized: "扫码")
+            case .manual: String(localized: "手动添加")
+            }
+        }
+
+
+        var symbol: String {
+            switch self {
+            case .paste: "doc.on.clipboard"
+            case .scan: "qrcode.viewfinder"
+            case .manual: "slider.horizontal.3"
+            }
+        }
+    }
+
+    init(editingNode: ProxyNode? = nil) {
+        self.editingNode = editingNode
+        _entryMode = State(initialValue: editingNode == nil ? .paste : .manual)
+        _manualDraft = State(initialValue: editingNode.map { ManualNodeDraft(node: $0) } ?? ManualNodeDraft())
+    }
+
+    /// Detection parses every node of a pasted batch. It runs once per edit
+    /// of `sourceValue`, not on every render that reads the result.
+    @State private var detectedKind: SourceInputKind = .unknown
+    /// The input `detectedKind` describes; saving waits until they agree.
+    @State private var detectedValue = ""
+
+    private var addSheetCancelItem: some ToolbarContent {
+        ToolbarItem(placement: .cancellationAction) {
+            Button("取消") {
+                requestsDiscard = true
+            }
+        }
+    }
+
+    private var addSheetConfirmItem: some ToolbarContent {
+        ToolbarItem(placement: .confirmationAction) {
+            Button(saveButtonTitle) {
+                focusedField = nil
+                saveTask = Task { await save() }
+            }
+            .disabled(isSaveDisabled)
+            .accessibilityIdentifier("save-source")
+        }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if editingNode == nil {
+                    sourceModePicker
+                }
+
+                switch entryMode {
+                case .paste:
+                    pasteSections.transition(.opacity)
+                case .scan:
+                    scanSections.transition(.opacity)
+                case .manual:
+                    manualSections.transition(.opacity)
+                }
+
+                if let errorMessage {
+                    Section {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Section {
+                    PrivacyBadge()
+                        .listRowBackground(Color.clear)
+                } footer: {
+                    Text("订阅内容、节点凭据和转换结果都只保存在这台设备上。")
+                }
+            }
+            .navigationTitle(editingNode == nil ? String(localized: "添加订阅或节点") : String(localized: "编辑"))
+            .navigationBarTitleDisplayMode(.inline)
+            .scrollDismissesKeyboard(.interactively)
+            .toolbar16 {
+                addSheetCancelItem
+                addSheetConfirmItem
+            }
+            // Only manual entry needs a way out of the keyboard: its port
+            // and similar fields use a number pad, which has no return
+            // key. Pasting and scanning dismiss with a scroll, as the
+            // page already allows, without a control floating over it.
+            .toolbar16 {
+                ToolbarItemGroup(placement: .keyboard) {
+                    if entryMode == .manual {
+                        Spacer()
+                        KeyboardDismissButton(title: "完成") { focusedField = nil }
+                    }
+                }
+            }
+            .confirmDiscardChanges(hasChanges: hasChanges, isBusy: isSaving, requested: $requestsDiscard) { saveTask?.cancel() }
+            .animation(TowerMotion.selection(reduceMotion: reduceMotion), value: entryMode)
+            .onAppear {
+                if editingNode == nil { requestClipboardContent() }
+            }
+            .onDisappear {
+                saveTask?.cancel()
+                cancelClipboardRead()
+            }
+            .onChange(of: sourceValue) { _ in
+                cancelClipboardRead()
+                errorMessage = nil
+            }
+            .task(id: sourceValue) {
+                let value = sourceValue
+                let kind: SourceInputKind
+                if value.utf8.count > 4_096 {
+                    let worker = Task.detached(priority: .userInitiated) { SourceInputDetector().detect(value) }
+                    kind = await withTaskCancellationHandler { await worker.value } onCancel: { worker.cancel() }
+                } else {
+                    kind = detector.detect(value)
+                }
+                guard !Task.isCancelled else { return }
+                detectedKind = kind
+                detectedValue = value
+            }
+            .onChange(of: entryMode) { _ in
+                cancelClipboardRead()
+                focusedField = nil
+                errorMessage = nil
+            }
+        }
+    }
+
+    /// A segmented control with icons: one quiet track and a raised segment,
+    /// instead of three tiles where the selected one is a solid accent block.
+    private var sourceModePicker: some View {
+        HStack(spacing: 4) {
+            ForEach(EntryMode.allCases) { mode in
+                Button {
+                    focusedField = nil
+                    entryMode = mode
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: mode.symbol)
+                        Text(mode.title)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(entryMode == mode ? Color.accentColor : Color.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 40)
+                    .background {
+                        if entryMode == mode {
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .fill(Color(uiColor: .secondarySystemGroupedBackground))
+                                .shadow(color: .black.opacity(0.08), radius: 3, y: 1)
+                        }
+                    }
+                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .accessibilityAddTraits(entryMode == mode ? .isSelected : [])
+            }
+        }
+        .padding(4)
+        .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+        .listRowBackground(Color.clear)
+    }
+
+    @ViewBuilder
+    private var pasteSections: some View {
+        Section {
+            TextField("粘贴订阅链接或节点协议", text: $sourceValue, axis: .vertical)
+                .lineLimit(3...10)
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($focusedField, equals: .source)
+                .accessibilityIdentifier("source-value-field")
+
+            // One quiet row under the field: what was recognised on the
+            // left, paste again on the right. The page title already says
+            // what goes in the field, so the section has no header.
+            HStack(spacing: 12) {
+                detectionLabel
+                    .font(.subheadline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Button {
+                    pasteFromClipboard()
+                } label: {
+                    Image(systemName: "doc.on.clipboard")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .frame(width: 36, height: 36)
+                        .background(Color.accentColor.opacity(0.12), in: Circle())
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .accessibilityLabel(Text("从剪贴板重新粘贴"))
+            }
+            .padding(.vertical, -4)
+        } footer: {
+            Text("可一次粘贴多条链接，每行一条。支持 HTTP 和 HTTPS 订阅，以及 SS、SSR、VMess、VLESS、Trojan、Hysteria 2、AnyTLS、SOCKS5、HTTP(S) 节点。HTTP 订阅会明文传输订阅地址和节点内容。")
+        }
+
+        Section("名称（可选）") {
+            TextField("单条内容留空则自动命名", text: $name)
+                .textContentType(.organizationName)
+                .focused($focusedField, equals: .name)
+        }
+
+        Section {
+            DisclosureGroup("高级请求设置") {
+                TextField("自定义 User-Agent（可选）", text: $customUserAgent)
+                    .focused($focusedField, equals: .manual("userAgent"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("DNS-over-HTTPS 地址（可选）", text: $dnsOverHTTPSURL)
+                    .focused($focusedField, equals: .manual("dns"))
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+        } footer: {
+            Text("只对这个订阅生效。DNS 请填写 https://…/dns-query 形式的加密解析地址。")
+        }
+    }
+
+    @ViewBuilder
+    private var scanSections: some View {
+        Section {
+            QRCodeScannerPreview { value in
+                focusedField = nil
+                sourceValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                errorMessage = nil
+            }
+            .id(scanGeneration)
+            .accessibilityIdentifier("scan-node-qr")
+
+            Button("重新扫描", systemImage: "arrow.clockwise") {
+                sourceValue = ""
+                errorMessage = nil
+                scanGeneration = UUID()
+            }
+
+            if !sourceValue.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label("已识别", systemImage: "checkmark.circle.fill")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.green)
+                    Text(sourceValue)
+                        .font(.caption.monospaced())
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                    detectionLabel
+                        .font(.subheadline)
+                }
+            }
+        } footer: {
+            Text("支持订阅二维码，以及 SS、SSR、VMess、VLESS、Trojan、Hysteria、TUIC、WireGuard、AnyTLS、SOCKS5、HTTP(S) 节点二维码。")
+        }
+    }
+
+    @ViewBuilder
+    private var manualSections: some View {
+        Section("协议") {
+            Picker("节点协议", selection: $manualDraft.kind) {
+                ForEach(ManualNodeDraft.supportedKinds) { kind in
+                    Label {
+                        Text(kind.title)
+                    } icon: {
+                        ProtocolMenuIcon(kind: kind)
+                    }
+                    .tag(kind)
+                }
+            }
+            .onChange(of: manualDraft.kind) { selectedKind in
+                manualDraft.applyDefaults(for: selectedKind)
+            }
+        }
+
+        Section("节点") {
+            TextField("名称（可选）", text: $manualDraft.name)
+                .focused($focusedField, equals: .manual("name"))
+            TextField("服务器，例如 hk.example.com", text: $manualDraft.server)
+                .focused($focusedField, equals: .manual("server"))
+                .accessibilityIdentifier("manual-server")
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            TextField("端口", text: $manualDraft.port)
+                .focused($focusedField, equals: .manual("port"))
+                .keyboardType(.numberPad)
+        }
+
+        Section("认证") {
+            if [.shadowsocks, .shadowsocksR].contains(manualDraft.kind) {
+                Picker("加密方式", selection: $manualDraft.cipher) {
+                    ForEach(cipherOptions, id: \.self) { cipher in
+                        Text(cipher).tag(cipher)
+                    }
+                }
+            } else if manualDraft.kind == .vmess {
+                Picker("数据加密", selection: $manualDraft.cipher) {
+                    Text("自动").tag("auto")
+                    Text("AES-128-GCM").tag("aes-128-gcm")
+                    Text("ChaCha20-Poly1305").tag("chacha20-poly1305")
+                }
+            }
+            if [.socks5, .http, .masque].contains(manualDraft.kind) {
+                TextField("用户名（可选）", text: $manualDraft.username)
+                    .focused($focusedField, equals: .manual("username"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if [.ssh, .trustTunnel].contains(manualDraft.kind) {
+                TextField("用户名", text: $manualDraft.username)
+                    .focused($focusedField, equals: .manual("username"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if [.vmess, .vless, .tuic].contains(manualDraft.kind) {
+                TextField("UUID", text: $manualDraft.secret)
+                    .focused($focusedField, equals: .manual("secret"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            // TUIC authenticates with a UUID and a password, so it is the one
+            // protocol that needs both fields rather than either one.
+            if manualDraft.kind == .tuic {
+                SecureField("密码", text: $manualDraft.password)
+                    .focused($focusedField, equals: .manual("password"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if ![.vmess, .vless, .tuic, .wireguard].contains(manualDraft.kind) {
+                SecureField(secretPrompt, text: $manualDraft.secret)
+                    .focused($focusedField, equals: .manual("secret"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+            if manualDraft.kind == .vmess {
+                TextField("Alter ID", text: $manualDraft.alterID)
+                    .focused($focusedField, equals: .manual("alterID"))
+                    .keyboardType(.numberPad)
+            }
+            if manualDraft.kind == .snell {
+                Picker("协议版本", selection: $manualDraft.version) {
+                    ForEach((1 ... 6).map(String.init), id: \.self) { version in
+                        Text("v\(version)").tag(version)
+                    }
+                }
+            }
+        }
+
+        if manualDraft.kind == .shadowsocksR {
+            Section("ShadowsocksR 参数") {
+                Picker("协议", selection: $manualDraft.protocolName) {
+                    ForEach(["origin", "auth_sha1_v4", "auth_aes128_md5", "auth_aes128_sha1", "auth_chain_a"], id: \.self) {
+                        Text($0).tag($0)
+                    }
+                }
+                TextField("协议参数（可选）", text: $manualDraft.protocolParam)
+                    .focused($focusedField, equals: .manual("protocolParam"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Picker("混淆", selection: $manualDraft.obfs) {
+                    ForEach(["plain", "http_simple", "tls1.2_ticket_auth"], id: \.self) {
+                        Text($0).tag($0)
+                    }
+                }
+                TextField("混淆参数（可选）", text: $manualDraft.obfsParam)
+                    .focused($focusedField, equals: .manual("obfsParam"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            }
+        }
+
+        if [.shadowsocks, .snell].contains(manualDraft.kind) {
+            Section("混淆（可选）") {
+                Picker("模式", selection: $manualDraft.obfs) {
+                    Text("关闭").tag("none")
+                    Text("HTTP").tag("http")
+                    Text("TLS").tag("tls")
+                }
+                if manualDraft.obfs != "none" {
+                    TextField("混淆 Host", text: $manualDraft.obfsParam)
+                        .focused($focusedField, equals: .manual("obfsParam"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+            }
+        }
+
+        if manualDraft.kind == .hysteria2 {
+            Section {
+                Picker("混淆方式", selection: $manualDraft.obfs) {
+                    Text("关闭").tag("none")
+                    Text("Salamander").tag("salamander")
+                }
+                if manualDraft.obfs != "none" {
+                    SecureField("混淆密码", text: $manualDraft.obfsParam)
+                        .focused($focusedField, equals: .manual("obfsParam"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+            } header: {
+                Text("QUIC 混淆")
+            } footer: {
+                Text("混淆方式和密码必须与 Hysteria 2 服务端一致。")
+            }
+        }
+
+        if manualDraft.kind == .hysteria {
+            Section {
+                TextField("上行带宽（Mbps）", text: $manualDraft.upMbps)
+                    .focused($focusedField, equals: .manual("upMbps"))
+                    .keyboardType(.numberPad)
+                TextField("下行带宽（Mbps）", text: $manualDraft.downMbps)
+                    .focused($focusedField, equals: .manual("downMbps"))
+                    .keyboardType(.numberPad)
+                Picker("传输协议", selection: $manualDraft.protocolName) {
+                    Text("UDP").tag("udp")
+                    Text("wechat-video").tag("wechat-video")
+                    Text("faketcp").tag("faketcp")
+                }
+                TextField("混淆字符串（可选）", text: $manualDraft.obfs)
+                    .focused($focusedField, equals: .manual("obfs"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            } header: {
+                Text("带宽与混淆")
+            } footer: {
+                Text("Hysteria 按带宽控制发送速率，上下行必须填写，按您的实际线路填。填错会明显变慢。")
+            }
+        }
+
+        if manualDraft.kind == .tuic {
+            Section {
+                Picker("拥塞控制", selection: $manualDraft.congestionControl) {
+                    Text("默认").tag("")
+                    Text("BBR").tag("bbr")
+                    Text("Cubic").tag("cubic")
+                    Text("New Reno").tag("new_reno")
+                }
+                Picker("UDP 中继", selection: $manualDraft.udpRelayMode) {
+                    Text("默认").tag("")
+                    Text("native").tag("native")
+                    Text("quic").tag("quic")
+                }
+            } header: {
+                Text("QUIC 参数")
+            } footer: {
+                Text("不确定就保持默认，由客户端决定。")
+            }
+        }
+
+        if manualDraft.kind == .wireguard {
+            Section {
+                SecureField("客户端私钥", text: $manualDraft.wireGuardPrivateKey)
+                    .focused($focusedField, equals: .manual("wireGuardPrivateKey"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("服务端公钥", text: $manualDraft.wireGuardPublicKey)
+                    .focused($focusedField, equals: .manual("wireGuardPublicKey"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                SecureField("预共享密钥（可选）", text: $manualDraft.wireGuardPreSharedKey)
+                    .focused($focusedField, equals: .manual("wireGuardPreSharedKey"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            } header: {
+                Text("WireGuard 密钥")
+            } footer: {
+                Text("私钥只保存在这台设备及您主动开启的 iCloud 同步中。")
+            }
+
+            Section {
+                TextField("本机 IPv4，例如 10.0.0.2/32", text: $manualDraft.wireGuardIPv4)
+                    .focused($focusedField, equals: .manual("wireGuardIPv4"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("本机 IPv6（可选）", text: $manualDraft.wireGuardIPv6)
+                    .focused($focusedField, equals: .manual("wireGuardIPv6"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("允许的网段", text: $manualDraft.wireGuardAllowedIPs)
+                    .focused($focusedField, equals: .manual("wireGuardAllowedIPs"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("DNS（可选）", text: $manualDraft.wireGuardDNS)
+                    .focused($focusedField, equals: .manual("wireGuardDNS"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("Reserved，例如 1,2,3（可选）", text: $manualDraft.wireGuardReserved)
+                    .focused($focusedField, equals: .manual("wireGuardReserved"))
+                    .keyboardType(.numbersAndPunctuation)
+                TextField("MTU", text: $manualDraft.wireGuardMTU)
+                    .focused($focusedField, equals: .manual("wireGuardMTU"))
+                    .keyboardType(.numberPad)
+                TextField("保活间隔（秒）", text: $manualDraft.wireGuardPersistentKeepalive)
+                    .focused($focusedField, equals: .manual("wireGuardPersistentKeepalive"))
+                    .keyboardType(.numberPad)
+            } header: {
+                Text("WireGuard 隧道")
+            } footer: {
+                Text("允许的网段决定哪些目标进入隧道；代理用途通常填写 0.0.0.0/0,::/0。")
+            }
+        }
+
+        if manualDraft.kind == .ssh {
+            Section {
+                TextField("私钥（OpenSSH 格式，可选）", text: $manualDraft.sshPrivateKey, axis: .vertical)
+                    .focused($focusedField, equals: .manual("sshPrivateKey"))
+                    .lineLimit(3...8)
+                    .font(.footnote.monospaced())
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("服务器公钥（可选）", text: $manualDraft.sshHostKey)
+                    .focused($focusedField, equals: .manual("sshHostKey"))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+            } header: {
+                Text(verbatim: "SSH")
+            } footer: {
+                Text("填写服务器公钥后会校验服务器身份。Surge 不支持私钥登录，Stash 不支持校验服务器公钥。")
+            }
+        }
+
+        if manualDraft.kind == .trustTunnel {
+            Section {
+                Toggle("使用 HTTP/3（QUIC）", isOn: $manualDraft.trustTunnelQUIC)
+            } header: {
+                Text(verbatim: "TrustTunnel")
+            }
+        }
+
+        if manualDraft.kind == .anytls {
+            Section {
+                TextField("检查间隔（秒）", text: $manualDraft.idleSessionCheckInterval)
+                    .focused($focusedField, equals: .manual("idleSessionCheckInterval"))
+                    .keyboardType(.numberPad)
+                TextField("空闲超时（秒）", text: $manualDraft.idleSessionTimeout)
+                    .focused($focusedField, equals: .manual("idleSessionTimeout"))
+                    .keyboardType(.numberPad)
+                TextField("保留空闲会话数", text: $manualDraft.minIdleSession)
+                    .focused($focusedField, equals: .manual("minIdleSession"))
+                    .keyboardType(.numberPad)
+            } header: {
+                Text("会话维护")
+            } footer: {
+                Text("默认 30 秒检查、30 秒超时、保留 0 个；不确定时保持默认。")
+            }
+        }
+
+        if usesStreamTransport {
+            Section("传输") {
+                Picker("传输方式", selection: $manualDraft.transport) {
+                    Text("TCP").tag("tcp")
+                    Text("WebSocket").tag("ws")
+                    Text("gRPC").tag("grpc")
+                    Text("HTTP/2").tag("h2")
+                }
+                if ["ws", "h2"].contains(manualDraft.transport) {
+                    TextField("Host（可选）", text: $manualDraft.hostHeader)
+                        .focused($focusedField, equals: .manual("hostHeader"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                if ["ws", "h2", "grpc"].contains(manualDraft.transport) {
+                    TextField(manualDraft.transport == "grpc" ? "Service Name" : "路径，例如 /proxy", text: $manualDraft.path)
+                        .focused($focusedField, equals: .manual("path"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+            }
+        }
+
+        if offersSecurityPicker || usesMandatoryTLS {
+            Section {
+                if offersSecurityPicker {
+                    Picker("安全方式", selection: $manualDraft.security) {
+                        Text("无").tag("none")
+                        Text("TLS").tag("tls")
+                        if manualDraft.kind == .vless {
+                            Text("REALITY").tag("reality")
+                        }
+                    }
+                } else {
+                    LabeledContent("安全方式", value: "TLS")
+                }
+
+                if usesTLSSettings {
+                    TextField("SNI（可选）", text: $manualDraft.sni)
+                        .focused($focusedField, equals: .manual("sni"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("ALPN（可选，如 h2,http/1.1）", text: $manualDraft.alpn)
+                        .focused($focusedField, equals: .manual("alpn"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    if manualDraft.security != "reality" {
+                        TextField("证书 SHA-256 指纹（可选）", text: $manualDraft.certificateFingerprint)
+                            .focused($focusedField, equals: .manual("certificateFingerprint"))
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                    Toggle("允许不安全证书", isOn: $manualDraft.skipCertificateVerification)
+                }
+
+                if manualDraft.kind == .vless && manualDraft.security == "reality" {
+                    TextField("REALITY 服务器公钥", text: $manualDraft.realityPublicKey)
+                        .focused($focusedField, equals: .manual("realityPublicKey"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("Short ID（可选）", text: $manualDraft.realityShortID)
+                        .focused($focusedField, equals: .manual("realityShortID"))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    Picker("客户端指纹", selection: $manualDraft.fingerprint) {
+                        ForEach(["chrome", "safari", "firefox", "edge", "random"], id: \.self) {
+                            Text($0.capitalized).tag($0)
+                        }
+                    }
+                    Picker("流控", selection: $manualDraft.flow) {
+                        Text("无").tag("")
+                        Text("XTLS Vision").tag("xtls-rprx-vision")
+                    }
+                }
+            } header: {
+                Text("传输安全")
+            } footer: {
+                if manualDraft.security == "reality" {
+                    Text("REALITY 公钥必须与服务器一致；当前仅支持 TCP 或 gRPC 传输。")
+                }
+            }
+        }
+    }
+
+    private var cipherOptions: [String] {
+        if manualDraft.kind == .shadowsocksR {
+            return ["aes-256-cfb", "aes-192-cfb", "aes-128-cfb", "chacha20-ietf", "none"]
+        }
+        return [
+            "aes-256-gcm", "aes-128-gcm", "chacha20-ietf-poly1305",
+            "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"
+        ]
+    }
+
+    private var usesStreamTransport: Bool {
+        [.vmess, .vless, .trojan].contains(manualDraft.kind)
+    }
+
+    private var offersSecurityPicker: Bool {
+        [.vmess, .vless, .socks5, .http].contains(manualDraft.kind)
+    }
+
+    private var usesMandatoryTLS: Bool {
+        [.trojan, .hysteria, .hysteria2, .tuic, .masque, .anytls, .trustTunnel].contains(manualDraft.kind)
+    }
+
+    private var usesTLSSettings: Bool {
+        usesMandatoryTLS || ["tls", "reality"].contains(manualDraft.security)
+    }
+
+    @ViewBuilder
+    private var detectionLabel: some View {
+        switch detectedKind {
+        case .subscription:
+            Label("已识别为订阅链接", systemImage: "link.circle.fill")
+                .foregroundStyle(Color.accentColor)
+        case .subscriptionBatch(let count):
+            Label("已识别 \(count) 个订阅链接", systemImage: "link.badge.plus")
+                .foregroundStyle(Color.accentColor)
+        case .node(let kind):
+            Label {
+                Text("已识别为 \(kind.title) 节点")
+            } icon: {
+                ProtocolGlyph(kind: kind)
+            }
+                .foregroundStyle(.green)
+        case .nodeBatch(let count):
+            Label("已识别 \(count) 个节点", systemImage: "square.stack.3d.up.fill")
+                .foregroundStyle(.green)
+        case .unknown:
+            // A quiet hint, not a row that looks as tappable as the paste
+            // action above it.
+            Text("等待有效的订阅链接或节点协议")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var hasChanges: Bool {
+        name != "" || sourceValue != initialSourceValue || !customUserAgent.isEmpty || !dnsOverHTTPSURL.isEmpty
+            || manualDraft != (editingNode.map { ManualNodeDraft(node: $0) } ?? ManualNodeDraft())
+    }
+
+    private var saveButtonTitle: String {
+        if editingNode != nil { return String(localized: "保存") }
+        guard isSaving else { return String(localized: "添加") }
+        switch detectedKind {
+        case .subscription, .subscriptionBatch: return String(localized: "正在读取…")
+        default: return String(localized: "正在添加…")
+        }
+    }
+
+    private var isSaveDisabled: Bool {
+        if isSaving { return true }
+        if entryMode == .paste || entryMode == .scan {
+            return detectedValue != sourceValue || !detectedKind.isSupported
+        }
+        return manualDraft.server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || (Int(manualDraft.port).map { !(1 ... 65535).contains($0) } ?? true)
+            || isMissingRequiredCredential
+    }
+
+    /// Whether the protocol's own required fields are still blank.
+    ///
+    /// The form used to enable 添加 as soon as a server and port were typed and
+    /// then throw the real requirement back as an error afterwards. Validating
+    /// inline is the same check, made before the tap instead of after it.
+    private var isMissingRequiredCredential: Bool {
+        func blank(_ value: String) -> Bool {
+            value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let needsSecret: [ProxyKind] = [
+            .shadowsocks, .shadowsocksR, .vmess, .vless, .trojan,
+            .hysteria, .hysteria2, .tuic, .anytls, .snell
+        ]
+        if needsSecret.contains(manualDraft.kind), blank(manualDraft.secret) { return true }
+        if manualDraft.kind == .ssh,
+           blank(manualDraft.username) || (blank(manualDraft.secret) && blank(manualDraft.sshPrivateKey)) {
+            return true
+        }
+        if manualDraft.kind == .trustTunnel, blank(manualDraft.username) || blank(manualDraft.secret) {
+            return true
+        }
+        if manualDraft.kind == .tuic, blank(manualDraft.password) { return true }
+        if [.shadowsocks, .shadowsocksR].contains(manualDraft.kind), blank(manualDraft.cipher) {
+            return true
+        }
+        if manualDraft.security == "reality", blank(manualDraft.realityPublicKey) { return true }
+        if manualDraft.kind == .hysteria {
+            let up = Int(manualDraft.upMbps) ?? 0
+            let down = Int(manualDraft.downMbps) ?? 0
+            if up <= 0 || down <= 0 { return true }
+        }
+        if manualDraft.kind == .wireguard {
+            let values = [
+                manualDraft.wireGuardPrivateKey,
+                manualDraft.wireGuardPublicKey,
+                manualDraft.wireGuardAllowedIPs
+            ]
+            if values.contains(where: blank)
+                || (blank(manualDraft.wireGuardIPv4) && blank(manualDraft.wireGuardIPv6)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private var secretPrompt: String {
+        switch manualDraft.kind {
+        case .shadowsocks, .shadowsocksR: String(localized: "密码")
+        case .trojan, .hysteria2, .anytls, .snell: String(localized: "密码或 PSK")
+        case .hysteria: String(localized: "认证密码")
+        case .wireguard: String(localized: "WireGuard 密钥")
+        case .socks5, .http, .masque, .ssh: String(localized: "密码（可选）")
+        case .trustTunnel: String(localized: "密码")
+        default: String(localized: "认证信息")
+        }
+    }
+
+    private func requestClipboardContent() {
+        guard !didReadPasteboard else { return }
+        didReadPasteboard = true
+        // Focus only once the clipboard has answered. A supported link fills
+        // the field with the keyboard down; focusing first raised it and then
+        // dismissed it again on the most common path.
+        readClipboard(automatically: true)
+    }
+
+    /// The automatic read found nothing to fill: hand the field to typing,
+    /// unless the user has already chosen a field themselves.
+    private func focusSourceAfterEmptyClipboard() {
+        guard focusedField == nil else { return }
+        focusedField = .source
+    }
+
+    private func pasteFromClipboard() {
+        readClipboard(automatically: false)
+    }
+
+    private func cancelClipboardRead() {
+        clipboardGeneration = UUID()
+        clipboardProgress?.cancel()
+        clipboardProgress = nil
+    }
+
+    private func readClipboard(automatically: Bool) {
+        cancelClipboardRead()
+        let generation = clipboardGeneration
+        let originalValue = sourceValue
+        // Synchronous UIPasteboard.string can wait for Universal Clipboard or
+        // system permission while holding SwiftUI's layout transaction open.
+        guard let provider = UIPasteboard.general.itemProviders.first(where: {
+            $0.canLoadObject(ofClass: NSString.self) || $0.canLoadObject(ofClass: NSURL.self)
+        }) else {
+            if automatically { focusSourceAfterEmptyClipboard() }
+            else { errorMessage = String(localized: "等待有效的订阅链接或节点协议") }
+            return
+        }
+        let completion: @Sendable (NSItemProviderReading?, Error?) -> Void = { object, _ in
+            let text = (object as? String) ?? (object as? URL)?.absoluteString ?? ""
+            let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            Task { @MainActor in
+                // A late paste must not overwrite typing, another mode, or a
+                // dismissed panel. Cancellation alone does not guarantee this.
+                guard generation == clipboardGeneration, entryMode == .paste,
+                      sourceValue == originalValue else { return }
+                clipboardProgress = nil
+                guard !value.isEmpty else {
+                    if automatically { focusSourceAfterEmptyClipboard() }
+                    else { errorMessage = String(localized: "等待有效的订阅链接或节点协议") }
+                    return
+                }
+                guard !automatically || detector.detect(value).isSupported else {
+                    focusSourceAfterEmptyClipboard()
+                    return
+                }
+                sourceValue = value
+                if automatically { initialSourceValue = value }
+                focusedField = nil
+            }
+        }
+        clipboardProgress = provider.canLoadObject(ofClass: NSString.self)
+            ? provider.loadObject(ofClass: NSString.self, completionHandler: completion)
+            : provider.loadObject(ofClass: NSURL.self, completionHandler: completion)
+    }
+
+    private func save() async {
+        guard !isSaving else { return }
+        focusedField = nil
+        isSaving = true
+        errorMessage = nil
+        defer { isSaving = false }
+
+        do {
+            if entryMode == .manual {
+                if let editingNode {
+                    try model.updateLocalNode(editingNode, with: manualDraft)
+                } else {
+                    try model.addManualNode(manualDraft)
+                }
+            } else {
+                switch detectedKind {
+                case .subscription:
+                    try await model.addSubscription(
+                        name: name,
+                        urlString: sourceValue,
+                        userAgent: customUserAgent,
+                        dnsOverHTTPSURL: dnsOverHTTPSURL
+                    )
+                case .subscriptionBatch:
+                    try await model.addSubscriptions(
+                        name: name,
+                        urlStrings: detector.subscriptionURLs(sourceValue),
+                        userAgent: customUserAgent,
+                        dnsOverHTTPSURL: dnsOverHTTPSURL
+                    )
+                case .node:
+                    try model.addLocalNode(name: name, uri: sourceValue)
+                case .nodeBatch:
+                    try model.addLocalNodes(name: name, content: sourceValue)
+                case .unknown:
+                    throw SubscriptionError.noSupportedNodes
+                }
+            }
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}

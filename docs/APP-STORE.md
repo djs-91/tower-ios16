@@ -1,0 +1,55 @@
+# App Store 文案
+
+发布前核对成稿与当前实现。这里不记录首发备选稿、旧版本营销文案或未经核验的审核推断。隐私细节以 [privacy.md](privacy.md) 为准。
+
+## 副标题
+
+订阅转配置，全程在本机完成
+
+## 关键词候选
+
+- 简体：格式转换,节点管理,规则,策略组,分组,离线,隐私,批量,扫码,导入,导出,YAML,INI
+- 英文：converter,format,config file,nodes,rules,policy group,offline,privacy,local,yaml,ini,json
+
+提交前在 App Store Connect 核对对应语言的长度限制，勿把第三方客户端商标作为搜索关键词。
+
+## 描述成稿
+
+塔台是在 iPhone 本机运行的配置文件转换工具。它管理你已有的订阅文本、自有节点和分流规则，生成其他客户端能读取的配置文件。
+
+支持十三种节点协议的解析，并按目标客户端的实际能力输出；无法忠实表达的条目明确计入跳过。你可以按地区查看节点、测试延迟、定制规则，预览并分享生成的配置。
+
+转换在设备上完成，不经过塔台服务器或第三方在线转换服务。规则快照和离线 IP 国家库随 App 提供，也可以主动导入自己的 HTTPS 规则方案。
+
+订阅凭据默认留在本机。iCloud 同步与“代理集合”均默认关闭：前者由你授权后存入自己的 iCloud，后者把原始订阅链接写入导出配置，让兼容客户端自行更新远端节点。分享文件前，请确认接收方可信。
+
+一键导入使用本机限时服务；局域网共享需要主动开启，并使用随机密钥，仅在塔台前台运行时提供服务。凭据类文件使用 iOS 完整文件保护。
+
+塔台没有账号系统、分析统计、广告或崩溃上报。源码公开：https://github.com/pengchujin/tower
+
+塔台只负责格式转换，不包含 VPN 或代理连接功能，不创建网络隧道、不接管系统流量，也不提供服务器或节点。你需要自备订阅内容，并在相应客户端中使用生成的配置。
+
+## 审核备注成稿
+
+本 App 是本机配置文件转换工具，将用户提供的订阅文本转换成 YAML、INI、JSON 或节点订阅文件。它不使用 NetworkExtension，不创建隧道、不转发系统流量、不提供节点。
+
+转换不经过在线转换服务。用户可主动开启自己的 iCloud 同步，或在兼容客户端配置中引用原始订阅 URL；这些功能默认关闭并有说明。开发者不收集订阅、节点或使用数据。
+
+Info.plist 的 NSAllowsArbitraryLoads 用于用户自行提供的 HTTP 订阅地址和本机配置交接服务；HTTP 输入会提示明文风险。正常一键导入只绑定 127.0.0.1、3 分钟失效。用户单独开启局域网共享时才请求本地网络权限，并通过随机访问密钥保护配置。
+
+无登录功能，不需要演示账号。转换测试需要脱敏的订阅样本，不要向审核备注附加个人真实订阅凭据。源码：https://github.com/pengchujin/tower
+
+## 提交字段与核对
+
+| 字段 | 当前内容 |
+| --- | --- |
+| 类别 | 工具 |
+| 支持 URL | https://pengchujin.github.io/tower/support.html |
+| 隐私政策 URL | https://pengchujin.github.io/tower/privacy.html |
+| 营销 URL | 可留空 |
+| 设备 | iPhone、iPad；Mac 版通过 GitHub Releases 和 Homebrew 分发 |
+| 截图 | iPhone 6.9″ 与 iPad 13″ 各 5 张，Mac 4 张；拍摄方法见 [DEVELOPMENT](DEVELOPMENT.md#app-store-截图) |
+| 隐私问卷 | 按实际无开发者数据收集行为填写，并与隐私政策、PrivacyInfo.xcprivacy 核对 |
+| 出口合规 | 当前工程 ITSAppUsesNonExemptEncryption = NO；引入新的加密实现时重新评估 |
+
+提交前实际打开支持/隐私 URL，核对截图与待发布包一致；销售地区和审核决定由发布负责人确认。归档与上传流程见 [RELEASING](RELEASING.md)。

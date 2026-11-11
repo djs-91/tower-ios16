@@ -1,0 +1,49 @@
+.DS_Store
+
+# Xcode user state and build output
+.derived*/
+.artifacts/
+build/
+DerivedData/
+output/
+*.xcuserstate
+xcuserdata/
+*.xcarchive
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.bcsymbolmap
+*.log
+
+# SwiftPM and local tooling
+.build/
+.swiftpm/
+.xcode.env.local
+.playwright-cli/
+__pycache__/
+
+# Agent scratch output. These have held unrelated personal documents;
+# they are not part of the source handoff and must never be committed.
+.codex_work/
+outputs/
+
+# Local image-generation exports occasionally land at the repository root.
+/Codex 图像 *.png
+
+# Signing and App Store Connect credentials must never enter Git
+*.p12
+*.mobileprovision
+AuthKey_*.p8
+ExportOptions.plist
+
+# Machine-specific release settings. This repository is public, so the release
+# host, its repository path and the Apple team ID live here and never in Git.
+# LOCAL_RELEASE.md was previously held back only by .git/info/exclude, which is
+# local to one clone and silently absent in every other.
+Config/release.local.sh
+LOCAL_RELEASE.md
+
+# iOS 16 port helpers live at the repository root on the porting machine only.
+# They rewrite the pristine tree and must never enter Git; Scripts/*.py (upstream
+# maintenance tooling) stays tracked because this rule is anchored at the root.
+/*.py

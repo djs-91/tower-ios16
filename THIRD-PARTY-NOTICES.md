@@ -1,0 +1,105 @@
+# 第三方资源说明
+
+塔台的源码以 MIT 许可证发布（见 `LICENSE`）。但 `Tower/Resources/` 下随 App 打包的规则列表和 IP 数据库来自第三方，**它们各自保留原有许可条款，不适用 MIT**。
+
+本文件记录每一项的来源、固定版本和许可状态。哈希与规则条数记录在各自的 `manifest.json` 中，可用对应脚本重新生成核对。
+
+---
+
+## ACL4SSR 规则
+
+- **来源**：https://github.com/ACL4SSR/ACL4SSR
+- **固定版本**：`802e3abf065f8609e7d9073ba506158dbe2ba6e7`
+- **本地路径**：`Tower/Resources/ACL4SSR/`（3 份 `.ini` 配置 + 32 个 `.list` 规则）
+- **托管派生资源**：`Rulesets/ACL4SSR/<固定版本>/`（不随 App 打包）
+- **许可证**：**CC BY-SA 4.0**（https://creativecommons.org/licenses/by-sa/4.0/）
+- **更新脚本**：`Scripts/update_acl4ssr_rules.py`
+- **清单**：`Tower/Resources/ACL4SSR/ACL4SSR_manifest.json`
+
+按 CC BY-SA 4.0 的要求：署名归 ACL4SSR 项目及其贡献者所有；这些规则文件本身以原样再分发，未作内容修改（仅为避免 bundle 内文件名冲突而统一加了 `ACL4SSR_` 前缀，并把 `master` 链接改写为上述固定版本）；对这些规则数据的任何再分发或改编，仍须以 CC BY-SA 4.0 或兼容许可发布。
+
+为避免将 classical 规则行误当成 domain MRS 的字面域名，托管的 MRS 不直接复用上游 `Clash/mrs`。更新脚本从上述固定 `.list` 快照中只提取可无损表达的 `DOMAIN` / `DOMAIN-SUFFIX`；IP CIDR 还要求每行恰好只带一个 `no-resolve` 修饰符。脚本用固定版本 Mihomo 生成 MRS，并回读校验条数和内容，其他类型仍由塔台内联输出。ipcidr 清单项会明确记录 `noResolve: true`，供客户端生成器在使用前再次校验。这些二进制是 ACL4SSR 规则的派生作品，同样以 CC BY-SA 4.0 分发；它们仅供用户主动开启远程规则集时由兼容客户端下载，不随 App 打包。
+
+同一脚本还用固定版本 sing-box 把可无损表达的 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD`、`IP-CIDR`、`IP-CIDR6` 和 `IP6-CIDR` 编译为 source-format v2 SRS。每个原始列表对应一个组合 SRS；CIDR 只接受无附加参数或唯一的 `no-resolve`，其他参数会按类型族关闭转换并保留内联。脚本编译后立即反编译并验证语义，临时 source JSON 与反编译结果不发布。清单记录源/产物 SHA-256、转换与残余条数、覆盖的原始规则类型、source format 版本和编译器版本。SRS 与 MRS 一样是 ACL4SSR 的 CC BY-SA 4.0 派生作品，仅供兼容客户端按需下载，不随 App 打包。每个列表另有一份只含 `DOMAIN`、`DOMAIN-SUFFIX`、`DOMAIN-KEYWORD` 的 `_singbox_domain.srs`，供 sing-box DNS 规则引用。
+
+同一脚本还把可无损表达的规则改写成 Loon（`_loon.list`）、Quantumult X（`_quanx.list`）和 Egern（`_egern.yaml`）的远程列表格式，写法与塔台逐条写进这些配置时一致；某一类型只要有一行不能无损转换，整类保留内联。`Tower_GEOIP_CN_*.list` 保存 ACL4SSR 配置自带的最后一条 `GEOIP,CN`，`Tower_catch_all_quanx.list` 是塔台自己的 Quantumult X DNS 保护规则。这些文件同样以 CC BY-SA 4.0 分发，不随 App 打包。
+
+## Self-Configuration（用户手动下载）
+
+App 和本仓库不再包含 Self-Configuration 的配置、规则列表或图标。规则页只提供指向项目上游的手动下载入口；下载由用户明确触发，内容保存在用户设备的 Application Support 中并可随时删除。因此它不属于 `Tower/Resources/` 下随 App 再分发的第三方资源。
+
+## IP 国家与网络组织数据库
+
+- **来源**：https://github.com/sapics/ip-location-db（`server-country`、`origin-asn`）
+- **固定快照**：`2026-09-06T22:31Z`；各源文件固定 asset ID 与 SHA-256 见 `IPCountryManifest.json`
+- **本地路径**：`Tower/Resources/IPCountry/`
+- **许可证**：**Open Data Commons PDDL 1.0**（https://opendatacommons.org/licenses/pddl/1-0/）
+- **更新脚本**：`Scripts/update_ip_country_db.py`；只接受哈希匹配的源文件，支持 `--source-dir` 离线重建
+- **说明文件**：`Tower/Resources/IPCountry/NOTICE.txt`
+- **边界**：服务器 IP 地区不是代理出口检测；ASN 组织名称不必然等于零售运营商。所有查询在本机完成，不发送节点 IP 到第三方查询接口。
+
+## 世界地图点阵
+
+- **来源**：[Natural Earth](https://www.naturalearthdata.com)，`ne_110m_land`、`ne_110m_admin_0_countries`
+- **本地路径**：`Tower/Resources/WorldMap/`
+- **许可证**：**公共领域**（Natural Earth 明确放弃所有权利，无需署名）
+- **更新脚本**：`Scripts/update_world_dot_map.py`
+- **说明文件**：`Tower/Resources/WorldMap/WorldMap-NOTICE.txt`
+
+首页地图不是 MapKit，而是把陆地和国家边界栅格化成相同尺寸的 Mercator 点阵文本。运行时读取 `WorldDotMap.txt` 的陆地点和 `WorldDotCountries.txt` 的国家归属，不做图像解码；虽然公共领域无需署名，仍记录来源与版本以便追溯和重新生成。
+
+## 国家/地区名称与坐标表
+
+- **来源**：[Natural Earth](https://www.naturalearthdata.com)，`ne_110m_admin_0_countries`
+- **本地路径**：`Tower/Services/CountryTable.swift`（生成的 Swift 源码，不是打包资源）
+- **许可证**：**公共领域**（同上，无需署名）
+- **更新脚本**：`Scripts/update_country_table.py`
+
+节点地区识别用的中英文国名、别名和标注坐标由该数据集生成。生成的是源码而不是资源文件，因为它只有几百行常量、需要在代码评审里看见 diff，也省掉一次启动时的文件读取。Natural Earth 的 110m 精度会略掉香港、新加坡、澳门这类小面积地区，脚本里按名单单独补齐。
+
+## 策略组图标
+
+- **Emoji 图片**：Microsoft Fluent Emoji 3D，https://github.com/microsoft/fluentui-emoji ，固定版本 `1ffb34c752ecf5d402f04cfb4b392c77f57c54bc`，MIT 许可。
+- **国旗**：flag-icons（1x1 方形版），https://github.com/lipis/flag-icons ，固定版本 `ac7e0eb3259eb62aa6100c435607e2fe03896a97`，MIT 许可。
+- **本地路径**：`Tower/Resources/PolicyGroupIcons/`（只有 Emoji → 图片路径的索引与 NOTICE，不含任何图片）
+- **托管派生资源**：`Rulesets/PolicyGroupIcons/<flag-icons 版本>/`（187 张圆形国旗 PNG）和 `Rulesets/PolicyGroupIcons/FluentCircle/`（给 Quantumult X 的全部 Fluent 3D 圆底 PNG 和 187 张 144×144 圆形国旗），都不随 App 打包
+
+导出配置时，塔台把策略组 Emoji 对应的 Fluent 3D 图片地址（jsDelivr 上的固定版本）写进支持图标的客户端，不打包、不转存这些图片。国旗由 flag-icons 的 SVG 裁成圆形、加一圈极淡的描边后渲染为 256×256 PNG，图形本身未修改。Quantumult X 的圆底图标是 Fluent 3D 原图缩放后放在浅色圆形底上、渲染为 144×144 PNG，Emoji 图形本身未修改。三者都不适用塔台源码的 MIT 许可声明之外的条款，仍按各自 MIT 许可分发。生成脚本：`Scripts/update_policy_group_icons.py`。
+
+## 客户端 App 图标
+
+导出页用各客户端的 App Store 图标标识目标，随 App 打包在 `Tower/Assets.xcassets/Client*.imageset/`：
+
+| 资源 | 客户端 | 权利人 |
+| --- | --- | --- |
+| `ClientSurge` | Surge | Nanjing Yiwo Information Technology |
+| `ClientSurgeMac` | Surge Mac | Nanjing Yiwo Information Technology |
+| `ClientStash` | Stash | Rocket Team |
+| `ClientShadowrocket` | Shadowrocket | Shadow Launch Technology Limited |
+| `ClientLoon` | Loon | Lin Zhang |
+| `ClientQuantumultX` | Quantumult X | Cross Utility |
+| `ClientHiddify` | Hiddify Proxy & VPN | Holistic Resilience |
+| `ClientAnywhere` | Anywhere | NodePassProject / respective rights holders |
+| `ClientEgern` | Egern | BYTE CROSSING LTD |
+| `ClientClashMi` | Clash Mi | Supernova Nebula LLC |
+| `ClientKaring` | Karing | Supernova Nebula LLC |
+| `ClientClashVerge` | Clash Verge Rev | Clash Verge Rev contributors |
+| `ClientClashMac` | ClashMac | ClashMac developers |
+| `ClientFlClash` | FlClash | FlClash contributors |
+| `ClientMihomoParty` | Mihomo Party | Mihomo Party contributors |
+
+这些图标是各自权利人的商标，**不适用本项目的 MIT 许可**。塔台仅将其用于在导出目标列表里指代对应客户端（指称性使用），不表示任何关联、赞助或背书，也不分发这些客户端软件本身。Surge Mac 图标取自本机官方 6.4.4 安装包。移动客户端图标取自 Apple 的公开 iTunes Search API 返回的 artwork 地址。Clash Verge 图标取自 [v2.5.2 官方发布包](https://github.com/clash-verge-rev/clash-verge-rev/releases/tag/v2.5.2)；ClashMac 图标取自 [27.1.4 官方发布包](https://github.com/666OS/ClashMac/releases/tag/27.1.4)，仅将 ICNS 转成 PNG，未修改图案。权利人如有异议可提 issue，将立即移除并改用 SF Symbol 占位。
+
+2026-09-27 起，所有客户端图标统一等比缩放到最长边 180 像素（界面最大显示 58pt，按 3 倍屏约 174 像素），以免首次显示时在主线程解码 512–1024 像素的原图；只改尺寸，未修改图案或颜色。
+
+README 使用的 `docs/images/clients/*.png` 是上述图标的展示副本（含 sing-box、V2Box 和 Clash 的同源图标）：方形原图按 iOS 图标的圆角裁切四角，自带形状的原图只缩放，下方附客户端名称；未修改图案或颜色，权利归属与上表相同。
+
+## 客户端配置格式
+
+塔台生成 Surge、Clash/Stash/Clash Mi/Karing、Shadowrocket、Loon、Quantumult X、Hiddify/sing-box MT 和 Egern 七类配置。这些格式的规范归各自客户端的开发者所有，本项目仅按其公开文档生成配置文件，不包含、不修改、不分发任何客户端软件。
+
+FlClash 图标取自 [官方项目 assets/images/icon.png](https://github.com/chen08209/FlClash/blob/main/assets/images/icon.png)，仅用于标识对应客户端。
+
+Mihomo Party 图标取自本机已安装的官方应用，仅将 ICNS 转成 PNG，用于标识导出客户端。
+
+Anywhere 图标来自上游 README 的官方资源 https://storage.argsment.com/Anywhere-AppIcon-iOS.png ，2026-09-14 获取，对应源码参考版本 `9ae49a73a0cf15317712545f9ead679da43cd308`。仅用于识别目标客户端，权利保留；来源说明见该 imageset 的 NOTICE.txt，未打包上游 GPL 源码。

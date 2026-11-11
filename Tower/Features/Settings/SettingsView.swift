@@ -1,0 +1,1283 @@
+import SwiftUI
+import UIKit
+
+struct SettingsView: View {
+    @Binding var configurationNameDraft: ConfigurationNameDraft
+
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var showsOnboarding = false
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 22) {
+                VStack(alignment: .leading, spacing: 16) {
+                    SectionHeading(title: "订阅与提醒")
+                    RenewalReminderSection()
+                    Divider()
+                    AutoRefreshSection()
+                }
+                .padding(17).towerCard()
+                NodeAndExportSettingsCard(configurationNameDraft: $configurationNameDraft)
+                VStack(alignment: .leading, spacing: 16) {
+                    SectionHeading(title: "连接")
+                    TailnetSettingsRow()
+                }
+                .padding(17).towerCard()
+                ConfigurationManagementCard(configurationNameDraft: $configurationNameDraft)
+                // Help sits with the other reference material at the end,
+                // not above every setting as if it were the first one.
+                Button {
+                    if TowerPlatform.isMac {
+                        model.isReplayingMacOnboarding = true
+                        dismiss()
+                    } else {
+                        showsOnboarding = true
+                    }
+                } label: {
+                    HStack(spacing: 13) {
+                        SettingsIconTile(symbol: "book.closed", color: .orange)
+                        Text("使用引导")
+                            .font(.body)
+                            .foregroundStyle(.primary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .contentShape(Rectangle())
+                    .padding(17).towerCard()
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .accessibilityIdentifier("replay-onboarding")
+                SettingsFooter()
+            }
+            .padding(.horizontal, TowerTheme.pagePadding)
+            .padding(.top, 12)
+            .padding(.bottom, 28)
+        }
+        .background(TowerTheme.background.ignoresSafeArea())
+        .navigationTitle("设置")
+        .fullScreenCover(isPresented: $showsOnboarding) {
+            WelcomeView { showsOnboarding = false }
+        }
+    }
+}
+
+/// Sync and destructive reset have separate surfaces and visual weight.
+private struct ConfigurationManagementCard: View {
+    @Binding var configurationNameDraft: ConfigurationNameDraft
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            CloudSyncControls(configurationNameDraft: $configurationNameDraft)
+
+            ResetAllConfigurationRow(configurationNameDraft: $configurationNameDraft)
+                .padding(17)
+                .towerCard()
+        }
+    }
+}
+
+/// Reset remains a stable row with a centered alert.
+///
+/// A destructive confirmation dialog anchored to a scrolling row can appear
+/// to drift on iPad. An alert stays centered and gives the consequences enough
+/// room to remain readable on every device size.
+private struct ResetAllConfigurationRow: View {
+    @EnvironmentObject private var model: AppModel
+    @Binding var configurationNameDraft: ConfigurationNameDraft
+    @State private var isConfirmingReset = false
+    @State private var isResetting = false
+
+    var body: some View {
+        Button(role: .destructive) {
+            isConfirmingReset = true
+        } label: {
+            HStack(spacing: 13) {
+                SettingsIconTile(symbol: "arrow.counterclockwise.circle.fill", color: .red)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("重置所有配置")
+                        .font(.body)
+                        .foregroundStyle(.red)
+                    Text("删除订阅、节点和这台设备上的设置")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if isResetting {
+                    ProgressView()
+                }
+            }
+            .frame(minHeight: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(ResponsivePressButtonStyle())
+        .disabled(model.isCloudSyncing || model.isRemovingCloudSnapshot || isResetting)
+        .accessibilityIdentifier("reset-all-configuration")
+        .alert("重置所有配置？", isPresented: $isConfirmingReset) {
+            Button("重置所有配置", role: .destructive) {
+                isResetting = true
+                Task { @MainActor in
+                    await model.resetAllConfiguration()
+                    configurationNameDraft = ConfigurationNameDraft(text: TowerBrand.localizedName)
+                    isResetting = false
+                }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("将清除这台设备上的订阅、自建节点、规则自定义、导出偏好和本机缓存，并关闭续费提醒、局域网共享及 iCloud 同步。此操作无法撤销；iCloud 上的副本不会被删除，系统权限也不会改变。")
+        }
+    }
+}
+
+/// Off by default, like everything else here that reaches the network.
+///
+/// iOS does not run Tower in the background, so this fetches when the app is
+/// opened or comes back to the foreground, never on a schedule. The row is
+/// named for that moment — "打开塔台时" — rather than promising the
+/// subscription stays current on its own.
+private struct AutoRefreshSection: View {
+    @EnvironmentObject private var model: AppModel
+    private var binding: Binding<Bool> {
+        Binding(get: { model.autoRefreshOnOpen }, set: model.setAutoRefreshOnOpen)
+    }
+
+    var body: some View {
+        Toggle(isOn: binding) {
+            SettingsRowLabel(
+                symbol: "arrow.clockwise",
+                color: .green,
+                title: "打开塔台时更新订阅",
+                resolvedDetail: model.autoRefreshOnOpen
+                    ? String(localized: "每次打开或切回塔台时刷新一次")
+                    : String(localized: "只在您下拉刷新时更新")
+            )
+        }
+    }
+}
+
+/// Off by default, and deliberately not phrased as a convenience.
+///
+/// Everything else in Tower keeps the subscription on the device. Turning this
+/// on is the one action that changes that, so the card says what actually
+/// happens rather than "sync your settings" — the user is agreeing to put
+/// subscription URLs and node passwords in their iCloud account.
+private struct CloudSyncControls: View {
+    @Binding var configurationNameDraft: ConfigurationNameDraft
+    @EnvironmentObject private var model: AppModel
+    @State private var isConfirming = false
+    @State private var isConfirmingDisable = false
+    @State private var showsRecovery = false
+
+    private var binding: Binding<Bool> {
+        Binding(
+            get: { model.iCloudSyncEnabled },
+            set: { wantsOn in
+                if wantsOn {
+                    isConfirming = true
+                } else {
+                    // Switching off is also the moment to offer taking the
+                    // uploaded credentials back out of iCloud, which is the
+                    // only place in Tower where they ever left the device.
+                    isConfirmingDisable = true
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 13) {
+                SectionHeading(title: "iCloud 同步")
+                // Two rows: the switch, and the backups. Syncing now lives in
+                // the status line it updates, and deleting the iCloud copy is
+                // offered where sync is switched off and on the backups page,
+                // not as a third row that only repeats that choice.
+                HStack(spacing: 13) {
+                    SettingsIconTile(symbol: "icloud.fill", color: .blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("同步到我的 iCloud")
+                            .font(.body)
+                        HStack(spacing: 6) {
+                            Text(statusText)
+                                .foregroundStyle(.secondary)
+                            if model.iCloudSyncEnabled {
+                                Text(verbatim: "·")
+                                    .foregroundStyle(.tertiary)
+                                    .accessibilityHidden(true)
+                                Button(model.isCloudSyncing ? "正在同步…" : "立即同步") {
+                                    Task { await model.synchronizeWithCloud(showResult: true) }
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(Color.accentColor)
+                                // The status truncates first; the action stays whole.
+                                .fixedSize()
+                                .disabled(model.isCloudSyncing || model.isRemovingCloudSnapshot)
+                                .accessibilityIdentifier("cloud-sync-now")
+                            }
+                        }
+                        .font(.caption)
+                        .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Toggle("同步到我的 iCloud", isOn: binding)
+                        .labelsHidden()
+                        .disabled(model.isCloudSyncing || model.isRemovingCloudSnapshot)
+                }
+
+                CloudCardDivider()
+
+                Button {
+                    // Save a typed name first: the restore then backs it up, and
+                    // the chosen version's name is not overridden by the draft.
+                    model.setConfigurationName(configurationNameDraft.committedName)
+                    showsRecovery = true
+                } label: {
+                    CloudActionRow(symbol: "clock.arrow.circlepath", color: .indigo,
+                                   title: "恢复同步备份")
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .disabled(model.isCloudSyncing || model.isRemovingCloudSnapshot)
+            }
+            .padding(17)
+            .towerCard()
+
+            if let issue = model.cloudSyncIssue {
+                Text(issue).font(.caption).foregroundStyle(.orange)
+            }
+
+        }
+        .navigationDestination(isPresented: $showsRecovery) { CloudRecoveryView() }
+        .alert("开启 iCloud 同步？", isPresented: $isConfirming) {
+            Button("开启") { Task { await model.setICloudSyncEnabled(true) } }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("您的订阅地址和节点密码会上传到您自己的 iCloud 账户，用于在同一 Apple 账户的设备之间同步。它们不会发给塔台或任何第三方。关闭同步后可以选择一并删除 iCloud 上的副本。")
+        }
+        .confirmationDialog(
+            "关闭 iCloud 同步？",
+            isPresented: $isConfirmingDisable,
+            titleVisibility: .visible
+        ) {
+            Button("关闭并删除 iCloud 副本", role: .destructive) {
+                Task {
+                    await model.setICloudSyncEnabled(false)
+                    await model.removeCloudSnapshot()
+                }
+            }
+            Button("只关闭同步") {
+                Task { await model.setICloudSyncEnabled(false) }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("只关闭同步会把已经上传的订阅地址和节点密码留在 iCloud 上。删除副本不影响这台设备上的配置。")
+        }
+    }
+
+    private var statusText: LocalizedStringKey {
+        if !model.isCloudAccountAvailable { return "此设备未登录 iCloud" }
+        guard model.iCloudSyncEnabled else { return "配置只保存在这台设备上" }
+        guard let at = model.lastCloudSyncAt else { return "已开启" }
+        return "上次同步 \(at.formatted(date: .omitted, time: .shortened))"
+    }
+}
+
+/// Reference information belongs at the end of the page, below every setting.
+/// It remains reachable without looking like another configuration control.
+private struct SettingsFooter: View {
+    private var versionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "—"
+        guard let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+              !build.isEmpty else {
+            return version
+        }
+        return "\(version) (\(build))"
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            NavigationLink {
+                SecurityAndSourceView()
+            } label: {
+                Text("安全与开源")
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("security-and-source-link")
+
+            Text(verbatim: "·")
+            Text("版本 \(versionText)")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 2)
+        .padding(.bottom, 6)
+    }
+}
+
+struct SecurityAndSourceView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                ForEach(WelcomeView.promises) { promise in
+                    if promise.id == WelcomeView.sourceRowID {
+                        Link(destination: WelcomeView.repositoryURL) {
+                            PromiseRow(
+                                promise: promise,
+                                trailing: WelcomeView.repositoryURL.absoluteString
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(ResponsivePressButtonStyle())
+                        .accessibilityLabel(Text("在浏览器中打开源代码仓库"))
+                    } else {
+                        PromiseRow(promise: promise)
+                    }
+                }
+            }
+            .padding(18)
+            .towerCard()
+            .padding(.horizontal, TowerTheme.pagePadding)
+            .padding(.top, 14)
+            .padding(.bottom, 28)
+        }
+        .background(TowerTheme.background.ignoresSafeArea())
+        .navigationTitle("安全与开源")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct NodeAndExportSettingsCard: View {
+    @Binding var configurationNameDraft: ConfigurationNameDraft
+    @EnvironmentObject private var model: AppModel
+    private var appendNameBinding: Binding<Bool> {
+        Binding(
+            get: { model.appendSubscriptionNameToNodes },
+            set: model.setAppendSubscriptionNameToNodes
+        )
+    }
+
+    private var filterInfoBinding: Binding<Bool> {
+        Binding(
+            get: { model.filterSubscriptionInfoNodes },
+            set: model.setFilterSubscriptionInfoNodes
+        )
+    }
+
+    private var preferRuleSetsBinding: Binding<Bool> {
+        Binding(
+            get: { model.preferRuleSets },
+            set: model.setPreferRuleSets
+        )
+    }
+
+    private var embedRemoteSubscriptionLinksBinding: Binding<Bool> {
+        Binding(
+            get: { model.embedRemoteSubscriptionLinks },
+            set: model.setEmbedRemoteSubscriptionLinks
+        )
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            SectionHeading(title: "节点与配置", detail: String(localized: "默认保持原始订阅"))
+
+            Toggle(isOn: appendNameBinding) {
+                SettingsRowLabel(
+                    symbol: "tag.fill",
+                    color: .blue,
+                    title: "节点附加订阅名称",
+                    detail: "节点名后显示来源，便于区分多个订阅服务。"
+                )
+            }
+            .accessibilityIdentifier("append-subscription-name-toggle")
+
+            Divider()
+
+            Toggle(isOn: filterInfoBinding) {
+                SettingsRowLabel(
+                    symbol: "line.3.horizontal.decrease.circle.fill",
+                    color: .orange,
+                    title: "过滤订阅节点信息",
+                    detail: "开启后隐藏流量、到期、官网和客服等信息节点。"
+                )
+            }
+            .accessibilityIdentifier("filter-subscription-info-toggle")
+
+            Divider()
+
+            Toggle(isOn: preferRuleSetsBinding) {
+                SettingsRowLabel(
+                    symbol: "square.stack.3d.up.fill",
+                    color: .purple,
+                    title: "优先使用规则集",
+                    detail: "兼容时引用远程规则集，不兼容的客户端会自动保留本地规则。"
+                )
+            }
+            .accessibilityIdentifier("prefer-rule-sets-toggle")
+
+            Divider()
+
+            Toggle(isOn: embedRemoteSubscriptionLinksBinding) {
+                SettingsRowLabel(
+                    symbol: "arrow.triangle.2.circlepath.circle.fill",
+                    color: .green,
+                    title: "代理集合",
+                    detail: "原始订阅链接直接写入配置文件，交由客户端更新。不支持 Shadowrocket、Hiddify、V2Box 和 sing-box MT。"
+                )
+            }
+            .accessibilityIdentifier("embed-remote-subscription-links-toggle")
+
+            Divider()
+
+            ConfigurationNameSettingsRow(configurationNameDraft: $configurationNameDraft)
+        }
+        .padding(17)
+        .towerCard()
+        .accessibilityIdentifier("node-export-settings-card")
+    }
+}
+
+/// The name edits in place, like a value in Settings: the whole row is the
+/// target, the text turns from a grey value to the text being typed, and the
+/// name is saved when editing ends rather than only when the sheet closes.
+private struct ConfigurationNameSettingsRow: View {
+    @Binding var configurationNameDraft: ConfigurationNameDraft
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @FocusState private var isFocused: Bool
+    @State private var commitTask: Task<Void, Never>?
+
+    var body: some View {
+        HStack(spacing: 13) {
+            SettingsIconTile(symbol: "doc.badge.gearshape", color: .teal)
+            Text("配置名称")
+                .font(.body)
+                .lineLimit(1)
+                .layoutPriority(1)
+            HStack(spacing: 6) {
+                TextField("配置名称", text: $configurationNameDraft.text)
+                    .focused($isFocused)
+                    .multilineTextAlignment(.trailing)
+                    // A value at rest, the text being typed while editing.
+                    .foregroundStyle(isFocused ? Color.primary : Color.secondary)
+                    .submitLabel(.done)
+                    .onSubmit { isFocused = false }
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityIdentifier("configuration-name-field")
+                accessory
+            }
+            .frame(minHeight: 36)
+        }
+        .frame(minHeight: 44)
+        .contentShape(Rectangle())
+        // The title and tile are part of the target, not only the short value.
+        .onTapGesture { isFocused = true }
+        .animation(TowerMotion.selection(reduceMotion: reduceMotion), value: isFocused)
+        // Closing the sheet saves the name itself, after its slide; a save
+        // left pending here would land in the middle of it.
+        .onDisappear { commitTask?.cancel() }
+        .onChange(of: isFocused) { focused in
+            commitTask?.cancel()
+            guard !focused else { return }
+            // A field left blank goes back to the last name, never to an
+            // empty value.
+            if configurationNameDraft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                configurationNameDraft.text = configurationNameDraft.committedName
+            }
+            // Save once the keyboard is down. Saving writes the whole state
+            // file and redraws the export page behind the sheet; done on the
+            // same frame as Done, it took the keyboard's slide with it. The
+            // sheet's own Done still saves at once if it comes first.
+            commitTask = Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(450))
+                guard !Task.isCancelled, !isFocused else { return }
+                model.setConfigurationName(configurationNameDraft.committedName)
+            }
+        }
+    }
+
+    /// Clear while typing, so replacing the name is one tap; back to the
+    /// default once done. A blank value is deliberately ignored — SwiftUI
+    /// publishes one while tearing a focused field down — so the default
+    /// needs a control of its own.
+    @ViewBuilder private var accessory: some View {
+        if isFocused {
+            if !configurationNameDraft.text.isEmpty {
+                Button {
+                    configurationNameDraft.text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.body)
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 28, height: 36)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text("清除文本"))
+                .transition(.opacity)
+            }
+        } else if configurationNameDraft.committedName != TowerBrand.localizedName {
+            Button {
+                configurationNameDraft.text = TowerBrand.localizedName
+                model.setConfigurationName(TowerBrand.localizedName)
+            } label: {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 28, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(Text("恢复默认配置名称"))
+            .accessibilityIdentifier("configuration-name-reset")
+            .transition(.opacity)
+        }
+    }
+}
+
+/// A link under the iCloud switch, in the same tile and title column.
+private struct CloudActionRow: View {
+    let symbol: String
+    let color: Color
+    let title: LocalizedStringKey
+
+    var body: some View {
+        HStack(spacing: 13) {
+            SettingsIconTile(symbol: symbol, color: color)
+            Text(title)
+                .font(.body)
+                .foregroundStyle(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.tertiary)
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+/// Starts under the titles, as list separators do, so the tiles stay one column.
+private struct CloudCardDivider: View {
+    var body: some View {
+        Divider().padding(.leading, 57)
+    }
+}
+
+/// The tinted square every settings row is introduced by.
+///
+/// Its own view because a third row now wants one — the configuration name
+/// field — and hand-copying these five modifiers is precisely how the tiles
+/// drifted to three different sizes the last time.
+struct SettingsIconTile: View {
+    let symbol: String
+    let color: Color
+
+    var body: some View {
+        Image(systemName: symbol)
+            .font(.system(size: 20, weight: .semibold))
+            .foregroundStyle(color)
+            .frame(width: 44, height: 44)
+            .background(color.opacity(0.1), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+    }
+}
+
+/// One row of the settings cards: an icon tile, a title, and a line of detail.
+///
+/// A view rather than a helper method so the sections that live in their own
+/// structs can use it too. It used to be a private method on the card, which is
+/// exactly how the rows drifted apart — the renewal section hand-rolled a
+/// slightly larger tile and the auto-refresh section had no icon at all.
+struct SettingsRowLabel: View {
+    let symbol: String
+    let color: Color
+    let title: LocalizedStringKey
+    private let detail: Text
+
+    init(symbol: String, color: Color, title: LocalizedStringKey, detail: LocalizedStringKey) {
+        self.symbol = symbol
+        self.color = color
+        self.title = title
+        self.detail = Text(detail)
+    }
+
+    /// For a detail chosen at runtime. Such a string has already been through
+    /// `String(localized:)`, and handing it back as a key would look it up a
+    /// second time — against itself.
+    init(symbol: String, color: Color, title: LocalizedStringKey, resolvedDetail: String) {
+        self.symbol = symbol
+        self.color = color
+        self.title = title
+        self.detail = Text(verbatim: resolvedDetail)
+    }
+
+    var body: some View {
+        HStack(spacing: 13) {
+            SettingsIconTile(symbol: symbol, color: color)
+            VStack(alignment: .leading, spacing: 3) {
+                // Regular weight: the card's section heading is the bold line.
+                Text(title).font(.body)
+                detail
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+/// A section of the node-and-export card rather than a card of its own.
+///
+/// Renewal reminders and automatic refresh both answer "what should Tower do
+/// with my subscriptions", which is the question that card is already about.
+/// As separate cards they read as three unrelated topics stacked up.
+private struct RenewalReminderSection: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isExpanded = false
+
+    private var reminderBinding: Binding<Bool> {
+        Binding(
+            get: { model.renewalRemindersEnabled },
+            set: { enabled in
+                Task { await model.setRenewalRemindersEnabled(enabled) }
+            }
+        )
+    }
+
+    var body: some View {
+        let reminders = model.renewalReminderEntries
+
+        VStack(alignment: .leading, spacing: 14) {
+            Toggle(isOn: reminderBinding) {
+                SettingsRowLabel(
+                    symbol: "bell.badge.fill",
+                    color: .orange,
+                    title: "到期前一天通知",
+                    detail: "按机场返回的到期时间自动更新"
+                )
+            }
+            .tint(.orange)
+            .disabled(model.isUpdatingRenewalReminders)
+            .accessibilityIdentifier("renewal-reminder-toggle")
+
+            if model.renewalRemindersEnabled && reminders.isEmpty {
+                Label("当前机场没有提供可提前一天安排的到期时间；下次更新订阅后会自动检测。", systemImage: "info.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if model.renewalRemindersEnabled && !reminders.isEmpty {
+                Divider()
+
+                Button {
+                    withAnimation(TowerMotion.disclosure(reduceMotion: reduceMotion)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Label(
+                            isExpanded ? String(localized: "收起具体提醒") : String(localized: "查看具体提醒"),
+                            systemImage: "calendar.badge.clock"
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        Spacer()
+                        Text("\(reminders.count) 个")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.down")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("renewal-reminder-disclosure")
+
+                if isExpanded {
+                    VStack(spacing: 0) {
+                        ForEach(Array(reminders.enumerated()), id: \.element.identifier) { index, reminder in
+                            if index > 0 { Divider() }
+                            RenewalReminderDetailRow(reminder: reminder)
+                        }
+                    }
+                    .transition(.opacity)
+                    .accessibilityIdentifier("renewal-reminder-list")
+                }
+            }
+        }
+        .accessibilityIdentifier("renewal-reminder-card")
+        .onChange(of: model.renewalRemindersEnabled) { isEnabled in
+            if !isEnabled { isExpanded = false }
+        }
+    }
+
+}
+
+private struct RenewalReminderDetailRow: View {
+    let reminder: SubscriptionExpiryEntry
+
+    private var status: SubscriptionExpiryStatus {
+        reminder.status()
+    }
+
+    private var isExpired: Bool {
+        if case .expired = status { return true }
+        return false
+    }
+
+    private var color: Color { isExpired ? .red : .orange }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: isExpired ? "exclamationmark.circle.fill" : "bell.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(color)
+                .frame(width: 30, height: 30)
+                .background(color.opacity(0.1), in: Circle())
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(statusTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(isExpired ? .red : .primary)
+                Text("到期日期：\(reminder.expiryDate.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.caption)
+                    .foregroundStyle(isExpired ? .red : .secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.vertical, 11)
+        .accessibilityElement(children: .combine)
+    }
+
+    private var statusTitle: String {
+        switch status {
+        case .upcoming(let days):
+            String(localized: "\(reminder.sourceName) 到期还剩 \(days) 天")
+        case .expired(let days):
+            String(localized: "\(reminder.sourceName) 已过期 \(days) 天")
+        }
+    }
+}
+
+struct LANSharingDestinationCard: View {
+    @EnvironmentObject private var model: AppModel
+    @State private var selectedClient: LANSubscriptionFormat?
+    @State private var isConfirmingTokenRotation = false
+
+    private var selectedURL: URL? {
+        model.lanSubscriptionURL(format: selectedClient)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            SectionHeading(
+                title: "局域网共享",
+                detail: model.isLANSharingActive
+                    ? String(localized: "正在共享")
+                    : String(localized: "默认关闭")
+            )
+
+            HStack(spacing: 13) {
+                Image(systemName: model.isLANSharingActive ? "wifi.circle.fill" : "wifi.slash")
+                    .font(.system(size: 28, weight: .semibold))
+                    .foregroundStyle(model.isLANSharingActive ? .green : .secondary)
+                    .frame(width: 52, height: 52)
+                    .background(
+                        (model.isLANSharingActive ? Color.green : Color.secondary).opacity(0.11),
+                        in: RoundedRectangle(cornerRadius: 15, style: .continuous)
+                    )
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.isLANSharingActive
+                        ? String(localized: "支持安卓、Windows、Mac、路由器等。")
+                        : String(localized: "没有对外提供服务"))
+                        .font(.headline)
+                    Text(model.isLANSharingActive
+                        ? String(localized: "自动识别客户端")
+                        : String(localized: "只有您主动开启后才会监听局域网"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if model.isLANSharingActive {
+                Divider()
+                clientPicker
+                if let selectedURL {
+                    URLPanel(url: selectedURL)
+                }
+            }
+
+            Button {
+                if model.isLANSharingActive {
+                    model.stopLANSharing()
+                } else {
+                    Task { await model.startLANSharing() }
+                }
+            } label: {
+                HStack(spacing: 9) {
+                    if model.isLANSharingStarting {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: model.isLANSharingActive ? "stop.fill" : "play.fill")
+                    }
+                    Text(model.isLANSharingActive
+                        ? String(localized: "停止共享")
+                        : String(localized: "开启局域网订阅"))
+                        .font(.headline)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .foregroundStyle(.white)
+                .background(
+                    model.isLANSharingActive ? Color.red : Color.accentColor,
+                    in: RoundedRectangle(cornerRadius: 15, style: .continuous)
+                )
+            }
+            .buttonStyle(ResponsivePressButtonStyle())
+            // Keep the button's changing position outside its press animation.
+            // Otherwise removing the link panel sends the label through the
+            // key action while the rest of the card has already collapsed.
+            .disabled(model.isLANSharingStarting)
+            .accessibilityIdentifier("lan-sharing-toggle")
+
+            Button {
+                isConfirmingTokenRotation = true
+            } label: {
+                Label("更换访问密钥", systemImage: "key.horizontal")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(ResponsivePressButtonStyle())
+        }
+        .padding(17)
+        .towerCard()
+        .accessibilityIdentifier("lan-subscription-card")
+        .confirmationDialog(
+            "更换访问密钥？",
+            isPresented: $isConfirmingTokenRotation,
+            titleVisibility: .visible
+        ) {
+            Button("更换密钥并停用旧链接", role: .destructive) {
+                model.rotateLANSharingToken()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("所有已经添加到电脑或路由器的塔台订阅链接都会失效。")
+        }
+    }
+
+    /// Label on the left, the current value as a button on the right.
+    ///
+    /// Rendered as a tinted chip rather than plain trailing text: as grey text
+    /// it read as a caption and gave no sign it could be tapped at all. The
+    /// menu opens in place instead of pushing a screen, because picking a
+    /// format is one tap of context, not a destination.
+    private var clientPicker: some View {
+        HStack(spacing: 12) {
+            Text("链接格式")
+                .font(.subheadline.weight(.semibold))
+
+            Spacer(minLength: 8)
+
+            Menu {
+                Picker("链接格式", selection: $selectedClient) {
+                    Label("自动识别客户端", systemImage: "wand.and.stars")
+                        .tag(LANSubscriptionFormat?.none)
+                    ForEach(LANSubscriptionFormat.allCases) { format in
+                        Label {
+                            Text(format.displayName)
+                        } icon: {
+                            Image(uiImage: LANClientMenuImages.image(for: format))
+                                .renderingMode(.original)
+                        }
+                            .tag(Optional(format))
+                    }
+                }
+                .pickerStyle(.inline)
+            } label: {
+                HStack(spacing: 6) {
+                    if let selectedClient {
+                        LANClientIcon(format: selectedClient, size: 20)
+                    } else {
+                        Image(systemName: "wand.and.stars")
+                            .font(.caption.weight(.semibold))
+                    }
+                    Text(selectedClient?.displayName ?? String(localized: "自动识别客户端"))
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.75)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2.weight(.bold))
+                }
+                .foregroundStyle(Color.accentColor)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 8)
+                .background(
+                    Color.accentColor.opacity(0.12),
+                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(ResponsivePressButtonStyle())
+            .accessibilityLabel(Text("链接格式"))
+            .accessibilityValue(Text(selectedClient?.displayName ?? String(localized: "自动识别客户端")))
+            .accessibilityIdentifier("lan-client-picker")
+        }
+    }
+
+}
+
+/// Native menu labels extract the image and discard SwiftUI clip/overlay
+/// modifiers. Bake the same rounded silhouette into transparent pixels instead.
+@MainActor
+private enum LANClientMenuImages {
+    private static let images: [String: UIImage] = {
+        let size: CGFloat = 20
+        let bounds = CGRect(x: 0, y: 0, width: size, height: size)
+        let rendererFormat = UIGraphicsImageRendererFormat()
+        rendererFormat.opaque = false
+        rendererFormat.scale = 3
+        let renderer = UIGraphicsImageRenderer(size: bounds.size, format: rendererFormat)
+        var images: [String: UIImage] = [:]
+        for format in LANSubscriptionFormat.allCases {
+            let asset = format.appIconAssetName
+            guard images[asset] == nil, let source = UIImage(named: asset),
+                  source.size.width > 0, source.size.height > 0 else { continue }
+            images[asset] = renderer.image { _ in
+                UIBezierPath(roundedRect: bounds, cornerRadius: size * 0.22).addClip()
+                let scale = max(size / source.size.width, size / source.size.height)
+                let width = source.size.width * scale
+                let height = source.size.height * scale
+                source.draw(in: CGRect(x: (size - width) / 2, y: (size - height) / 2,
+                                       width: width, height: height))
+            }.withRenderingMode(.alwaysOriginal)
+        }
+        return images
+    }()
+
+    static func image(for format: LANSubscriptionFormat) -> UIImage {
+        images[format.appIconAssetName] ?? UIImage(systemName: "app") ?? UIImage()
+    }
+}
+
+private struct LANClientIcon: View {
+    let format: LANSubscriptionFormat
+    let size: CGFloat
+
+    var body: some View {
+        Image(format.appIconAssetName)
+            .resizable()
+            .renderingMode(.original)
+            .scaledToFill()
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
+                    .strokeBorder(.primary.opacity(0.08), lineWidth: 0.5)
+            }
+            .accessibilityHidden(true)
+    }
+}
+
+private struct URLPanel: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let url: URL
+
+    @State private var isShowingQRCode = TowerPlatform.isMac
+    @State private var qrImage: UIImage?
+    /// Which address the image on screen encodes. Without it there is no way
+    /// to tell a current code from one left over by a format change.
+    @State private var qrRenderedURL: URL?
+    @State private var qrFailedURL: URL?
+    @State private var didCopy = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 11) {
+            Text(url.absoluteString)
+                .font(.caption.monospaced())
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("lan-subscription-url")
+
+            // Three equal columns rather than a wide primary beside a narrow
+            // secondary: none of these is the one right answer — which one you
+            // want depends on whether the other machine is in front of you.
+            HStack(spacing: 9) {
+                action("复制", symbol: "doc.on.doc", isOn: false) {
+                    UIPasteboard.general.string = url.absoluteString
+                    didCopy.toggle()
+                    model.showToast(String(localized: "局域网订阅链接已复制"), symbol: "doc.on.doc.fill")
+                }
+                action("二维码", symbol: "qrcode", isOn: isShowingQRCode) {
+                    // Nothing here was thrown by a gesture, so the panel
+                    // settles without overshoot.
+                    withAnimation(TowerMotion.surface(reduceMotion: reduceMotion)) {
+                        isShowingQRCode.toggle()
+                    }
+                }
+                ShareLink(item: url) {
+                    actionLabel("分享", symbol: "square.and.arrow.up", isOn: false)
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+            }
+
+            if isShowingQRCode {
+                qrCode
+                    .frame(maxWidth: .infinity)
+                    .transition(TowerMotion.surfaceTransition(reduceMotion: reduceMotion))
+            }
+        }
+        .padding(13)
+        .background(Color.accentColor.opacity(0.075), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
+        // One place owns the whole lifecycle. Splitting it between this task
+        // and an `onChange` that cleared the image raced: whichever ran first
+        // decided the outcome, and when the task won it saw the previous
+        // image, skipped rendering, and was then cleared — leaving the panel
+        // permanently blank after switching client format.
+        .task(id: qrTaskID) {
+            guard isShowingQRCode, qrRenderedURL != url || qrImage == nil else { return }
+            // A code for the previous address is worse than no code: it looks
+            // right and sends the other machine somewhere else.
+            qrImage = nil
+            qrFailedURL = nil
+            await renderQRCode()
+        }
+    }
+
+    private var qrTaskID: String { "\(url.absoluteString)-\(isShowingQRCode)" }
+
+    private var qrCode: some View {
+        // The same adaptive square and caption reserve the final layout while
+        // rendering or reporting failure. Only a code for this URL may appear.
+        VStack(spacing: 8) {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .frame(maxWidth: 216)
+                .overlay {
+                    if qrRenderedURL == url, let qrImage {
+                        Image(uiImage: qrImage)
+                            .resizable()
+                            .interpolation(.none)
+                            .scaledToFit()
+                            .padding(13)
+                            .background(.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                            .shadow(color: .black.opacity(0.08), radius: 12, y: 5)
+                            .transition(.asymmetric(insertion: .opacity, removal: .identity))
+                            .accessibilityLabel("局域网订阅地址的二维码")
+                    } else if qrFailedURL == url {
+                        Label("无法生成二维码", systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(13)
+                    } else {
+                        ProgressView()
+                    }
+                }
+            Text("用客户端扫这个码")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .opacity(qrRenderedURL == url && qrImage != nil ? 1 : 0)
+                .accessibilityHidden(qrRenderedURL != url || qrImage == nil)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private func action(
+        _ title: LocalizedStringKey,
+        symbol: String,
+        isOn: Bool,
+        perform: @escaping () -> Void
+    ) -> some View {
+        Button(action: perform) { actionLabel(title, symbol: symbol, isOn: isOn) }
+            .buttonStyle(ResponsivePressButtonStyle())
+    }
+
+    private func actionLabel(
+        _ title: LocalizedStringKey,
+        symbol: String,
+        isOn: Bool
+    ) -> some View {
+        VStack(spacing: 6) {
+            Image(systemName: symbol)
+                .font(.subheadline.weight(.semibold))
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 11)
+        .foregroundStyle(isOn ? Color.white : Color.accentColor)
+        .background(
+            isOn ? Color.accentColor : Color.accentColor.opacity(0.12),
+            in: RoundedRectangle(cornerRadius: 13, style: .continuous)
+        )
+        .contentShape(Rectangle())
+    }
+
+    @MainActor
+    private func renderQRCode() async {
+        qrFailedURL = nil
+        // The address carries the access key, so the PNG is as sensitive as the
+        // link. The shared builder writes it with complete protection into a
+        // folder it purges before each render.
+        guard let artifact = await QRCodeShareArtifactBuilder.make(value: url.absoluteString, id: UUID()) else {
+            guard !Task.isCancelled else { return }
+            withAnimation(TowerMotion.selection(reduceMotion: reduceMotion)) {
+                qrFailedURL = url
+            }
+            return
+        }
+        guard !Task.isCancelled else { return }
+        withAnimation(TowerMotion.selection(reduceMotion: reduceMotion)) {
+            qrRenderedURL = url
+            qrImage = artifact.image
+        }
+    }
+}
+
+struct LANSharingGuide: View {
+    @EnvironmentObject private var model: AppModel
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeading(title: "怎么使用", detail: "OpenClash · Windows · Mac")
+            VStack(alignment: .leading, spacing: 13) {
+                GuideRow(number: "1", text: "让设备连接同一个局域网，支持 Wi-Fi 或有线网络。")
+                GuideRow(number: "2", text: "开启服务，优先复制“自动识别客户端”链接。")
+                GuideRow(number: "3", text: "把链接作为订阅地址添加到客户端；Mac 上保持塔台运行，iPhone 上保持前台打开。")
+                Divider()
+                Label(
+                    model.embedRemoteSubscriptionLinks
+                        ? String(localized: "原始订阅链接直接写入配置文件，交由客户端更新。不支持 Shadowrocket、Hiddify、V2Box 和 sing-box MT。")
+                        : String(localized: "高级机场仍由塔台使用您设置的 UA 和 DNS 获取；桌面端只读取塔台生成的结果，不会拿到机场订阅密钥。"),
+                    systemImage: model.embedRemoteSubscriptionLinks
+                        ? "exclamationmark.shield.fill"
+                        : "lock.shield.fill"
+                )
+                    .font(.caption)
+                    .foregroundStyle(model.embedRemoteSubscriptionLinks ? Color.orange : Color.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(17)
+            .towerCard()
+        }
+    }
+}
+
+private struct GuideRow: View {
+    let number: String
+    let text: LocalizedStringKey
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            Text(number)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+                .frame(width: 24, height: 24)
+                .background(Color.accentColor, in: Circle())
+            Text(text)
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+
+/// A navigation destination avoids nesting another sheet under Settings:
+/// rebuilding a nested presentation can discard its confirmation action.
+private struct CloudRecoveryView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedCopy: CloudRecoveryCopy?
+    @State private var confirmsRestore = false
+    @State private var confirmsRemoval = false
+    @State private var didLoad = false
+
+    var body: some View {
+        List {
+            if !didLoad || model.isLoadingCloudRecoveryCopies {
+                HStack {
+                    Spacer()
+                    ProgressView("正在加载备份…")
+                    Spacer()
+                }
+                .listRowBackground(Color.clear)
+                .accessibilityIdentifier("recovery-loading")
+            } else {
+                ForEach(model.cloudRecoveryCopies) { copy in
+                    Button {
+                        selectedCopy = copy
+                        confirmsRestore = true
+                    } label: {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if copy.id == "current-local" {
+                                Text("当前使用").font(.headline)
+                            } else if let date = copy.snapshot.updatedAt, date > .distantPast {
+                                Text("配置修改时间").font(.caption).foregroundStyle(.secondary)
+                                Text(date.formatted(date: .numeric, time: .standard))
+                            }
+                            Text("\(copy.snapshot.nodes.count) 个节点 · \(copy.snapshot.importedSchemes?.count ?? 0) 个规则方案")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                if model.cloudRecoveryCopies.isEmpty { Text("暂无同步备份") }
+            }
+            // With sync off, the copy in iCloud is one of these backups; it
+            // is removed here, at the end of the list of what is stored.
+            if !model.iCloudSyncEnabled && model.isCloudAccountAvailable {
+                Section {
+                    Button(role: .destructive) {
+                        confirmsRemoval = true
+                    } label: {
+                        HStack {
+                            Text(model.isRemovingCloudSnapshot ? "正在删除…" : "删除 iCloud 上的副本")
+                            Spacer()
+                            if model.isRemovingCloudSnapshot { ProgressView() }
+                        }
+                    }
+                    .disabled(model.isRemovingCloudSnapshot || model.isCloudSyncing)
+                    .accessibilityIdentifier("remove-cloud-snapshot")
+                }
+            }
+        }
+        .navigationTitle("恢复同步备份")
+        .alert("删除 iCloud 上的副本？", isPresented: $confirmsRemoval) {
+            Button("删除", role: .destructive) {
+                Task { await model.removeCloudSnapshot(); await model.loadCloudRecoveryCopies() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("删除副本不影响这台设备上的配置，但无法从 iCloud 恢复这份副本。此操作无法撤销。")
+        }
+        .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { dismiss() } } }
+        .alert("恢复这份配置？", isPresented: $confirmsRestore, presenting: selectedCopy) { copy in
+            Button("恢复", role: .destructive) {
+                Task { await model.restoreCloudCopy(copy); await model.loadCloudRecoveryCopies() }
+            }
+            Button("取消", role: .cancel) { }
+        } message: { _ in
+            Text("恢复前会保留当前配置。开启同步时，所选版本也会成为云端版本，其他设备下次同步时会检查并合并。")
+        }
+        .task {
+            guard !didLoad else { return }
+            didLoad = true
+            await model.loadCloudRecoveryCopies()
+        }
+    }
+}

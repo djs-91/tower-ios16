@@ -1,0 +1,227 @@
+import XCTest
+
+@MainActor
+final class ClientPickerInteractionTests: XCTestCase {
+    func testAnywhereShowsNodeSubscriptionImport() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "--tab=export", "-hasSeenWelcome", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launch()
+        let first = app.buttons["client-shadowrocket"]
+        XCTAssertTrue(first.waitForExistence(timeout: 15))
+        let y = first.frame.midY
+        let anywhere = app.buttons["client-anywhere"]
+        for _ in 0..<8 {
+            if anywhere.exists && anywhere.frame.minX >= 0 && anywhere.frame.maxX <= app.frame.width { break }
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 330, dy: y))
+                .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 100, dy: y)))
+        }
+        XCTAssertTrue(anywhere.exists)
+        anywhere.tap()
+        assertExportTarget("Anywhere", in: app)
+        XCTAssertFalse(app.segmentedControls["export-content-mode"].exists)
+        XCTAssertTrue(app.buttons["export-config"].label.contains("仅导出节点到 Anywhere"))
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testSurgeNodeModeOffersCopyAndFullModeRestoresImport() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "--tab=export", "-hasSeenWelcome", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launch()
+        let modes = app.segmentedControls["export-content-mode"]
+        XCTAssertTrue(modes.waitForExistence(timeout: 10))
+        modes.buttons["仅节点"].tap()
+        let action = app.buttons["export-config"]
+        XCTAssertTrue(action.waitForExistence(timeout: 10))
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+        modes.buttons["完整配置"].tap()
+        XCTAssertTrue(action.label.contains("一键导出到 Surge"), action.label)
+        modes.buttons["仅节点"].tap()
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+        action.tap()
+        XCTAssertTrue(app.staticTexts["tower-toast"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["tower-toast"].label, "订阅链接已复制")
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(action.waitForExistence(timeout: 5))
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+    }
+
+    func testClashNodeModeOffersCopyAndRestoresFullExport() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "--tab=export", "-hasSeenWelcome", "YES", "-AppleLanguages", "(zh-Hans)"]
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launch()
+        let stash = app.buttons["client-clash"]
+        XCTAssertTrue(stash.waitForExistence(timeout: 10))
+        for _ in 0..<2 {
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 45, dy: stash.frame.midY))
+                .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 365, dy: stash.frame.midY)))
+        }
+        stash.tap()
+        let modes = app.segmentedControls["export-content-mode"]
+        XCTAssertTrue(modes.waitForExistence(timeout: 10))
+        modes.buttons["仅节点"].tap()
+        let action = app.buttons["export-config"]
+        XCTAssertTrue(action.label.contains("复制聚合的订阅链接"), action.label)
+        action.tap()
+        XCTAssertTrue(app.staticTexts["tower-toast"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.staticTexts["tower-toast"].label, "订阅链接已复制")
+        modes.buttons["完整配置"].tap()
+        XCTAssertTrue(action.label.contains("一键导出到 Stash"), action.label)
+    }
+
+    func testSwitchingClientsKeepsExportBarAndViewportStable() {
+        let app = XCUIApplication()
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launchEnvironment["TOWER_PERFORMANCE_NODE_COUNT"] = "1000"
+        app.launchArguments = ["-hasSeenWelcome", "YES", "--tab=export"]
+        app.launch()
+        let first = app.buttons["client-shadowrocket"]
+        XCTAssertTrue(first.waitForExistence(timeout: 15))
+        let button = app.buttons["export-config"]
+        XCTAssertTrue(button.waitForExistence(timeout: 10))
+        let originalButtonY = button.frame.minY
+        let originalPickerY = first.frame.minY
+        for target in ["client-clash", "client-shadowrocket", "client-clash", "client-shadowrocket"] {
+            app.buttons[target].tap()
+            XCTAssertTrue(button.exists)
+            XCTAssertEqual(button.frame.minY, originalButtonY, accuracy: 1)
+            XCTAssertEqual(first.frame.minY, originalPickerY, accuracy: 1)
+        }
+    }
+
+    func testTapSwipeAndLongPressReorder() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo", "-hasSeenWelcome", "YES"]
+        app.launch()
+        app.tabBars.buttons.element(boundBy: 2).tap()
+        let first = app.buttons["client-shadowrocket"]
+        let second = app.buttons["client-clash"]
+        XCTAssertTrue(first.waitForExistence(timeout: 10))
+        // The current target is restored into view on entry; browse back to
+        // the leading cards before testing their gestures.
+        for _ in 0..<2 {
+            app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 45, dy: first.frame.midY))
+                .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 365, dy: first.frame.midY)))
+        }
+        second.tap()
+        assertExportTarget("Stash", in: app)
+        first.tap()
+        assertExportTarget("Shadowrocket", in: app)
+
+        let origin = first.frame.midX
+        let y = first.frame.midY
+        // A quick pan must scroll, without changing order or selection.
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: second.frame.midX, dy: y))
+            .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 25, dy: y)))
+        XCTAssertLessThan(first.frame.midX, origin - 20)
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 35, dy: y))
+            .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 380, dy: y)))
+
+        // Hold before moving: move the first card into the second slot.
+        let target = second.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.5))
+        first.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: target)
+        XCTAssertGreaterThan(first.frame.midX, second.frame.midX)
+        assertExportTarget("Shadowrocket", in: app)
+        second.tap()
+        assertExportTarget("Stash", in: app)
+        first.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: second.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.5)))
+        XCTAssertLessThan(first.frame.midX, second.frame.midX)
+
+        // Reorder after scrolling: viewport and content coordinates differ.
+        app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 300, dy: y))
+            .press(forDuration: 0.01, thenDragTo: app.coordinate(withNormalizedOffset: .zero).withOffset(CGVector(dx: 50, dy: y)))
+        // Deceleration varies: choose fully visible cards, not an element
+        // whose accessibility frame has its center outside the viewport.
+        let visible = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'client-'"))
+            .allElementsBoundByIndex
+            .filter { $0.frame.minX >= 18 && $0.frame.maxX <= app.frame.width - 18 }
+            .sorted { $0.frame.minX < $1.frame.minX }
+        guard visible.count >= 2 else {
+            XCTFail("Expected two fully visible client cards")
+            return
+        }
+        // Bind by stable identity: index-based XCUIElement queries change
+        // which card they refer to when the accessibility order changes.
+        let source = app.buttons[visible[0].identifier]
+        let neighbor = app.buttons[visible[1].identifier]
+        source.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.5, thenDragTo: neighbor.coordinate(withNormalizedOffset: CGVector(dx: 0.75, dy: 0.5)))
+        XCTAssertGreaterThan(source.frame.midX, neighbor.frame.midX)
+        assertExportTarget("Stash", in: app)
+    }
+
+    private func assertExportTarget(_ name: String, in app: XCUIApplication) {
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", name),
+            object: app.buttons["export-config"]
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: 5), .completed)
+    }
+
+    func testFilterReorderAddRemoveAndRestart() {
+        exerciseFilter(largeText: false)
+    }
+
+    func testFilterAtAccessibilityTextSize() {
+        exerciseFilter(largeText: true)
+    }
+
+    private func exerciseFilter(largeText: Bool) {
+        let app = XCUIApplication()
+        app.launchEnvironment["TOWER_UI_TEST_RUN"] = UUID().uuidString
+        app.launchArguments = ["-hasSeenWelcome", "YES", "--tab=export"]
+        if largeText {
+            app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        }
+        app.launch()
+        app.tabBars.buttons.element(boundBy: 2).tap()
+        let openFilter = app.buttons["open-client-filter"]
+        XCTAssertTrue(openFilter.waitForExistence(timeout: 10))
+        openFilter.tap()
+        let first = app.descendants(matching: .any)["reorder-client:shadowrocket"].firstMatch
+        let second = app.descendants(matching: .any)["reorder-client:clash"].firstMatch
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        XCTAssertTrue(first.isHittable)
+        XCTAssertTrue(second.isHittable)
+        first.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.01, thenDragTo: second.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)))
+        XCTAssertGreaterThan(first.frame.midY, second.frame.midY)
+        app.buttons["hide-client:shadowrocket"].tap()
+        let add = app.buttons["show-client:shadowrocket"]
+        guard add.waitForExistence(timeout: 3) else {
+            let image = XCTAttachment(screenshot: app.screenshot())
+            image.lifetime = .keepAlways
+            self.add(image)
+            XCTFail("Remove after reorder must create an add row")
+            return
+        }
+        for _ in 0..<12 {
+            if add.isHittable { break }
+            app.swipeUp()
+        }
+        XCTAssertTrue(add.isHittable)
+        // The blank trailing area, not just the icon/name, must add the row.
+        add.coordinate(withNormalizedOffset: CGVector(dx: 0.7, dy: 0.5)).tap()
+        XCTAssertFalse(add.exists)
+        // Background flushes the coalesced write before relaunch.
+        XCUIDevice.shared.press(.home)
+        app.terminate()
+        app.launch()
+        app.tabBars.buttons.element(boundBy: 2).tap()
+        app.buttons["open-client-filter"].tap()
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        XCTAssertGreaterThan(first.frame.midY, second.frame.midY)
+        XCTAssertTrue(app.buttons["hide-client:shadowrocket"].isHittable)
+        let attachment = XCTAttachment(screenshot: app.screenshot())
+        attachment.name = largeText ? "filter-accessibility-text" : "filter-restored"
+        attachment.lifetime = .keepAlways
+        self.add(attachment)
+    }
+}

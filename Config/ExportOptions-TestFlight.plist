@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>destination</key>
+	<string>upload</string>
+	<key>method</key>
+	<string>app-store-connect</string>
+	<key>signingStyle</key>
+	<string>automatic</string>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<!-- teamID is deliberately absent: this repository is public. The release
+	     script copies this file and adds the key from TOWER_DEVELOPMENT_TEAM.
+	     See docs/RELEASING.md. -->
+	<key>uploadSymbols</key>
+	<true/>
+</dict>
+</plist>

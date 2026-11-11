@@ -1,0 +1,487 @@
+import UIKit
+import XCTest
+@testable import Tower
+
+final class ExportPresentationTests: XCTestCase {
+    func testTUICUsesADedicatedAvailableExportProtocolIcon() {
+        XCTAssertEqual(ProxyKind.tuic.symbol, "bolt.circle.fill")
+        XCTAssertNotNil(UIImage(systemName: ProxyKind.tuic.symbol))
+        XCTAssertNotEqual(ProxyKind.tuic.symbol, ProxyKind.vmess.symbol)
+        XCTAssertNotEqual(ProxyKind.tuic.symbol, ProxyKind.shadowsocks.symbol)
+    }
+
+    func testConfigurationPreviewSummaryBoundsLineCountAndLineLength() {
+        let longLine = String(repeating: "a", count: 1_200)
+        let content = ([longLine] + (1...40).map { "rule-\($0)" }).joined(separator: "\n")
+
+        let summary = ConfigurationPreviewFormatter.summary(from: content)
+        let lines = summary.components(separatedBy: .newlines)
+
+        XCTAssertLessThanOrEqual(lines.count, ConfigurationPreviewFormatter.summaryLineLimit)
+        XCTAssertTrue(lines.allSatisfy { $0.count <= ConfigurationPreviewFormatter.maximumSummaryLineLength + 2 })
+        XCTAssertTrue(lines[0].hasSuffix(" …"))
+    }
+
+    @MainActor
+    func testConfigurationTextViewUsesLazyLayoutForLargeSelectableContent() {
+        let textView = ConfigurationTextViewFactory.make()
+
+        XCTAssertFalse(textView.isEditable)
+        XCTAssertTrue(textView.isSelectable)
+        XCTAssertTrue(textView.isScrollEnabled)
+        XCTAssertNotNil(textView.textLayoutManager)
+        XCTAssertTrue(textView.textContainer.widthTracksTextView)
+    }
+
+    @MainActor
+    func testPreviewAccessibilityPreservesFullPlainTextAndTracksUpdates() {
+        let preview = AccessibleConfigurationPreview(isScrollEnabled: true)
+        let content = String(repeating: "🇯🇵 node = ss, 192.0.2.1, 443\n", count: 5000)
+        preview.render(content, spans: [])
+        XCTAssertTrue(preview.isAccessibilityElement)
+        XCTAssertTrue(preview.accessibilityTraits.contains(.staticText))
+        XCTAssertTrue(preview.textView.accessibilityElementsHidden)
+        XCTAssertEqual(preview.accessibilityLabel, content)
+        XCTAssertEqual(preview.textView.text, content)
+        XCTAssertTrue(preview.textView.isSelectable)
+        preview.render("replacement", spans: [])
+        XCTAssertEqual(preview.accessibilityLabel, "replacement")
+        XCTAssertEqual(preview.textView.text, "replacement")
+    }
+
+    @MainActor
+    func testPreviewAccessibilityScrollRespectsContentBounds() {
+        let preview = AccessibleConfigurationPreview(isScrollEnabled: true)
+        preview.frame = CGRect(x: 0, y: 0, width: 320, height: 400)
+        preview.layoutIfNeeded()
+        preview.textView.contentSize = CGSize(width: 320, height: 1200)
+        XCTAssertFalse(preview.accessibilityScroll(.up))
+        XCTAssertTrue(preview.accessibilityScroll(.down))
+        XCTAssertEqual(preview.textView.contentOffset.y, 320)
+        XCTAssertTrue(preview.accessibilityScroll(.up))
+        XCTAssertEqual(preview.textView.contentOffset.y, 0)
+        XCTAssertFalse(preview.accessibilityScroll(.left))
+    }
+
+    @MainActor
+    func testConfigurationEditorUsesGitHubStyleLineNumbersAndUnwrappedCode() {
+        let editor = ConfigurationEditorTextViewFactory.make()
+
+        XCTAssertTrue(editor.textView.isEditable)
+        XCTAssertTrue(editor.textView.isSelectable)
+        XCTAssertTrue(editor.textView.isScrollEnabled)
+        XCTAssertTrue(editor.textView.alwaysBounceHorizontal)
+        XCTAssertFalse(editor.textView.textContainer.widthTracksTextView)
+        XCTAssertEqual(editor.textView.textContainer.lineBreakMode, .byClipping)
+        XCTAssertGreaterThanOrEqual(editor.gutterWidth, 40)
+    }
+
+    @MainActor
+    func testConfigurationEditorHighlightsWithoutLosingSelectionOrLineNumbers() throws {
+        let editor = ConfigurationEditorTextViewFactory.make()
+        let original = "# note\n[custom]\nruleset=漏网之鱼,https://example.com/rules.list"
+        ConfigurationEditorTextViewFactory.render(original, in: editor)
+        editor.textView.selectedRange = NSRange(location: 9, length: 4)
+
+        let updated = original + "\nenable_rule_generator=true"
+        ConfigurationEditorTextViewFactory.render(updated, in: editor)
+
+        XCTAssertEqual(editor.textView.text, updated)
+        XCTAssertEqual(editor.textView.selectedRange, NSRange(location: 9, length: 4))
+        XCTAssertEqual(editor.lineNumberView.lineStarts.count, 4)
+        let keyRange = try XCTUnwrap((updated as NSString).range(of: "ruleset").nonEmpty)
+        let keyColor = editor.textView.attributedText.attribute(
+            .foregroundColor,
+            at: keyRange.location,
+            effectiveRange: nil
+        ) as? UIColor
+        XCTAssertNotNil(keyColor)
+        XCTAssertNotEqual(keyColor, UIColor.label)
+    }
+
+    func testQuanXPreviewUsesSectionSpecificSyntaxColors() throws {
+        let content = """
+        # Generated locally by 塔台
+        [general]
+        server_check_url = http://www.gstatic.com/generate_204
+        [dns]
+        no-system
+        server = 1.1.1.1
+        [policy]
+        static=🚀 节点选择, direct
+        """
+
+        let spans = ConfigurationSyntaxHighlighter.spans(in: content)
+
+        XCTAssertEqual(style(at: "# Generated locally by 塔台", in: content, spans: spans), .comment)
+        XCTAssertEqual(style(at: "[general]", in: content, spans: spans), .section(.blue))
+        XCTAssertEqual(style(at: "server_check_url", in: content, spans: spans), .key(.blue))
+        XCTAssertEqual(style(at: "http://www.gstatic.com/generate_204", in: content, spans: spans), .url)
+        XCTAssertEqual(style(at: "[dns]", in: content, spans: spans), .section(.purple))
+        XCTAssertEqual(style(at: "no-system", in: content, spans: spans), .directive(.purple))
+        XCTAssertEqual(style(at: "[policy]", in: content, spans: spans), .section(.teal))
+        XCTAssertEqual(style(at: "static=", in: content, spans: spans), .key(.teal))
+    }
+
+    func testYAMLPreviewCarriesSemanticColorIntoNestedKeys() {
+        let content = """
+        proxies:
+          - name: "Tokyo 01"
+            port: 443
+        rules:
+          - DOMAIN-SUFFIX,example.com,🚀 节点选择
+        """
+
+        let spans = ConfigurationSyntaxHighlighter.spans(in: content)
+
+        XCTAssertEqual(style(at: "proxies", in: content, spans: spans), .key(.teal))
+        XCTAssertEqual(style(at: "name", in: content, spans: spans), .key(.teal))
+        XCTAssertEqual(style(at: "\"Tokyo 01\"", in: content, spans: spans), .string)
+        XCTAssertEqual(style(at: "443", in: content, spans: spans), .number)
+        XCTAssertEqual(style(at: "rules", in: content, spans: spans), .key(.orange))
+        XCTAssertEqual(style(at: "DOMAIN-SUFFIX", in: content, spans: spans), .directive(.orange))
+    }
+
+    @MainActor
+    func testHighlightedConfigurationPreservesOriginalTextAndUsesDistinctColors() throws {
+        let content = "# note\n[general]\ntimeout = 5000"
+        let attributed = ConfigurationSyntaxHighlighter.attributedString(
+            for: content,
+            baseFont: UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+
+        XCTAssertEqual(attributed.string, content)
+        let commentRange = try XCTUnwrap((content as NSString).range(of: "# note").nonEmpty)
+        let sectionRange = try XCTUnwrap((content as NSString).range(of: "[general]").nonEmpty)
+        let commentColor = attributed.attribute(.foregroundColor, at: commentRange.location, effectiveRange: nil)
+            as? UIColor
+        let sectionColor = attributed.attribute(.foregroundColor, at: sectionRange.location, effectiveRange: nil)
+            as? UIColor
+
+        XCTAssertNotNil(commentColor)
+        XCTAssertNotNil(sectionColor)
+        XCTAssertNotEqual(commentColor, sectionColor)
+    }
+
+    @MainActor
+    func testConfigurationTextViewAppliesHighlightingWithoutLosingSelection() throws {
+        let textView = ConfigurationTextViewFactory.make()
+        let content = "# note\n[general]\ntimeout = 5000"
+        let expectedFont = UIFontMetrics(forTextStyle: .body).scaledFont(
+            for: UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+
+        ConfigurationTextViewFactory.render(content, in: textView)
+
+        XCTAssertEqual(textView.text, content)
+        XCTAssertEqual(textView.accessibilityAttributedValue?.string, content)
+        XCTAssertNil(textView.accessibilityAttributedValue?.attribute(.foregroundColor, at: 0, effectiveRange: nil))
+        XCTAssertGreaterThan(textView.attributedText.length, 0)
+        XCTAssertTrue(textView.isSelectable)
+        XCTAssertEqual(
+            try XCTUnwrap(textView.font).pointSize,
+            expectedFont.pointSize,
+            accuracy: 0.01,
+            "The preview should respect the current Dynamic Type category, including smaller text sizes."
+        )
+        XCTAssertGreaterThanOrEqual(textView.textContainerInset.left, 14)
+    }
+
+    func testEveryClientTargetUsesBundledOfficialAppIcon() {
+        for target in ClientTarget.allCases {
+            let asset = try? XCTUnwrap(target.appIconAssetName)
+            XCTAssertNotNil(asset, "\(target.name) 缺少 App Store 图标资源名")
+            if let asset {
+                XCTAssertNotNil(UIImage(named: asset), "\(target.name) 的 App Store 图标未打进资源包")
+            }
+        }
+    }
+
+    func testClashFormatUsesStashAppStoreIdentity() {
+        XCTAssertEqual(ClientTarget.clash.name, "Stash")
+        XCTAssertEqual(ClientTarget.clash.subtitle, "Clash YAML")
+        XCTAssertEqual(ClientTarget.clash.appIconAssetName, "ClientStash")
+        XCTAssertEqual(ClientTarget.clash.brandColorHex, "1473E6")
+    }
+
+    func testClashAppUsesASeparateOfficialAppStoreIdentity() throws {
+        let target = try XCTUnwrap(ClientTarget(rawValue: "clash-apple"))
+
+        XCTAssertEqual(target.name, "Clash")
+        XCTAssertEqual(target.subtitle, "Clash / mihomo")
+        XCTAssertEqual(target.fileExtension, "yaml")
+        XCTAssertEqual(target.appIconAssetName, "ClientClashOfficial")
+        XCTAssertNotNil(UIImage(named: "ClientClashOfficial"))
+        XCTAssertTrue(target.supportsDirectImport(mode: .fullConfiguration))
+        XCTAssertFalse(target.supportsDirectImport(mode: .nodesOnly))
+        XCTAssertEqual(ClientTargetOrder.defaultOrder.firstIndex(of: target), 5)
+    }
+
+    func testSingBoxMTUsesOfficialIdentityAndOnlyOffersFullProfileImport() throws {
+        let target = try XCTUnwrap(ClientTarget(rawValue: "sing-box"))
+
+        XCTAssertEqual(target.name, "sing-box MT")
+        XCTAssertEqual(target.subtitle, "sing-box JSON")
+        XCTAssertEqual(target.fileExtension, "json")
+        XCTAssertEqual(target.appIconAssetName, "ClientSingBox")
+        XCTAssertNotNil(UIImage(named: "ClientSingBox"))
+        XCTAssertEqual(target.supportedContentModes, [.fullConfiguration])
+        XCTAssertTrue(target.supportsDirectImport(mode: .fullConfiguration))
+        XCTAssertFalse(target.supportsDirectImport(mode: .nodesOnly))
+        XCTAssertEqual(ClientTargetOrder.defaultOrder.firstIndex(of: target), 8)
+    }
+
+    func testClashMiAndKaringKeepTheirPositionsWhenDesktopClientsAreAdded() throws {
+        let clashMi = try XCTUnwrap(ClientTarget(rawValue: "clash-mi"))
+        let karing = try XCTUnwrap(ClientTarget(rawValue: "karing"))
+
+        XCTAssertEqual(clashMi.name, "Clash Mi")
+        XCTAssertEqual(clashMi.subtitle, "Mihomo YAML")
+        XCTAssertEqual(clashMi.fileExtension, "yaml")
+        XCTAssertEqual(clashMi.appIconAssetName, "ClientClashMi")
+        XCTAssertNotNil(UIImage(named: "ClientClashMi"))
+        XCTAssertTrue(clashMi.supportsDirectImport(mode: .fullConfiguration))
+
+        XCTAssertEqual(karing.name, "Karing")
+        XCTAssertEqual(karing.subtitle, "Clash YAML")
+        XCTAssertEqual(karing.fileExtension, "yaml")
+        XCTAssertEqual(karing.appIconAssetName, "ClientKaring")
+        XCTAssertNotNil(UIImage(named: "ClientKaring"))
+        XCTAssertTrue(karing.supportsDirectImport(mode: .fullConfiguration))
+
+        XCTAssertEqual(Array(ClientTargetOrder.defaultOrder.suffix(7)), [.clashMi, .karing, .clashVerge, .clashMac, .flClash, .mihomoParty, .surgeMac])
+    }
+
+    func testV2BoxOnlyOffersNodeSubscription() throws {
+        let target = try XCTUnwrap(ClientTarget(rawValue: "v2box"))
+
+        XCTAssertEqual(target.name, "V2Box")
+        XCTAssertEqual(target.supportedContentModes, [.nodesOnly])
+        XCTAssertFalse(target.supportsDirectImport(mode: .fullConfiguration))
+        XCTAssertTrue(target.supportsDirectImport(mode: .nodesOnly))
+        XCTAssertEqual(target.fileExtension, "txt")
+    }
+
+    func testV2BoxSupportsEveryScreenshotConfirmedTowerProtocol() throws {
+        let target = try XCTUnwrap(ClientTarget(rawValue: "v2box"))
+        let supported = Set(ProxyKind.allCases.filter(target.supports))
+
+        XCTAssertEqual(
+            supported,
+            [.shadowsocks, .vmess, .vless, .trojan, .wireguard, .hysteria2, .socks5, .http]
+        )
+    }
+
+    func testExportedConfigurationUsesAStableClientSpecificFileName() {
+        let localizedAppName = String(localized: "塔台")
+
+        for target in ClientTarget.allCases {
+            XCTAssertEqual(
+                configuration(for: target).fileName,
+                "\(localizedAppName).\(target.fileExtension)",
+                target.name
+            )
+        }
+    }
+
+    func testCustomProfileNameIsSanitizedAndUsedForEveryTarget() {
+        let configuration = GeneratedConfiguration(
+            target: .loon,
+            content: "x",
+            supportedNodeCount: 1,
+            skippedNodeCount: 0,
+            ruleCount: 0,
+            profileName: "家庭/代理:配置"
+        )
+
+        XCTAssertEqual(configuration.fileName, "家庭 代理 配置.conf")
+    }
+
+    func testConfigurationNameDraftCanBeClearedBeforeDefaultIsCommitted() {
+        var draft = ConfigurationNameDraft(text: "塔台")
+
+        draft.text = ""
+
+        XCTAssertEqual(draft.text, "", "编辑过程中不能把默认名称强行写回输入框")
+        XCTAssertEqual(draft.committedName, TowerBrand.localizedName)
+        draft.text = "家庭网络配置"
+        XCTAssertEqual(draft.committedName, "家庭网络配置")
+    }
+
+    func testUntouchedConfigurationNameDraftFollowsARestoredName() {
+        var draft = ConfigurationNameDraft(text: "-QA塔台")
+
+        draft.followSavedName("塔台")
+
+        XCTAssertFalse(draft.isEdited)
+        XCTAssertEqual(draft.text, "塔台")
+        XCTAssertEqual(draft.committedName, "塔台", "关闭设置时不能把恢复前的旧名称写回去")
+    }
+
+    func testEditedConfigurationNameDraftKeepsTypedNameWhenSavedNameChanges() {
+        var draft = ConfigurationNameDraft(text: "塔台")
+        draft.text = "家庭网络"
+
+        draft.followSavedName("iCloud 名称")
+
+        XCTAssertTrue(draft.isEdited)
+        XCTAssertEqual(draft.text, "家庭网络", "正在输入的名称不能被同步拉下来的名称覆盖")
+        XCTAssertEqual(draft.committedName, "家庭网络")
+        draft.text = "iCloud 名称"
+        XCTAssertFalse(draft.isEdited)
+    }
+
+    func testFollowedConfigurationNameSurvivesATransientEmptyWrite() {
+        var draft = ConfigurationNameDraft(text: "-QA塔台")
+
+        draft.followSavedName("塔台")
+        draft.text = ""
+
+        XCTAssertEqual(draft.committedName, "塔台", "结束编辑时的临时空值不能退回跟随前的旧名称")
+    }
+
+    func testConfigurationNameDraftKeepsTheLastValidNameWhenTextFieldEndsWithATransientEmptyWrite() {
+        var draft = ConfigurationNameDraft(text: "塔台")
+
+        // This is the exact event sequence captured from the physical iPhone:
+        // the field receives the complete name, then SwiftUI writes an empty
+        // value while the focused field is being dismissed by the toolbar.
+        draft.text = "tower"
+        draft.text = ""
+
+        XCTAssertEqual(
+            draft.committedName,
+            "tower",
+            "结束编辑时的临时空值不能覆盖本次输入的最后一个有效名称"
+        )
+    }
+
+    /// The flip side of that rule: because a blank field is ignored, clearing
+    /// it can no longer mean "back to the default name". Writing the default in
+    /// has to work, which is what the reset control does.
+    func testConfigurationNameDraftCanBeReturnedToTheDefaultAfterACustomName() {
+        var draft = ConfigurationNameDraft(text: TowerBrand.localizedName)
+
+        draft.text = "tower"
+        draft.text = TowerBrand.localizedName
+
+        XCTAssertEqual(
+            draft.committedName,
+            TowerBrand.localizedName,
+            "改过名之后必须还能回到默认名称，否则默认值就成了单向门"
+        )
+    }
+
+    func testGenerationCacheKeepsConfigurationsForMultipleTargets() {
+        var cache = ConfigurationCache()
+        let surgeKey = GenerationCacheKey(target: .surge, presetID: "rules", nodesHash: 1, countryCodesHash: 1)
+        let loonKey = GenerationCacheKey(target: .loon, presetID: "rules", nodesHash: 1, countryCodesHash: 1)
+
+        cache[surgeKey] = configuration(for: .surge)
+        cache[loonKey] = configuration(for: .loon)
+
+        XCTAssertEqual(cache.count, 2)
+        XCTAssertEqual(cache[surgeKey]?.target, .surge)
+        XCTAssertEqual(cache[loonKey]?.target, .loon)
+    }
+
+    func testGenerationCacheDropsConfigurationsFromPreviousSnapshot() {
+        var cache = ConfigurationCache()
+        let oldKey = GenerationCacheKey(target: .surge, presetID: "rules", nodesHash: 1, countryCodesHash: 1)
+        let currentKey = GenerationCacheKey(target: .loon, presetID: "rules", nodesHash: 2, countryCodesHash: 1)
+
+        cache[oldKey] = configuration(for: .surge)
+        cache[currentKey] = configuration(for: .loon)
+
+        XCTAssertEqual(cache.count, 1)
+        XCTAssertNil(cache[oldKey])
+        XCTAssertEqual(cache[currentKey]?.target, .loon)
+    }
+
+    func testGenerationCacheDropsConfigurationsWhenCustomizedRulesChange() {
+        var cache = ConfigurationCache()
+        let oldKey = GenerationCacheKey(
+            target: .surge,
+            presetID: "rules",
+            nodesHash: 1,
+            countryCodesHash: 1,
+            rulesHash: 10
+        )
+        let currentKey = GenerationCacheKey(
+            target: .surge,
+            presetID: "rules",
+            nodesHash: 1,
+            countryCodesHash: 1,
+            rulesHash: 11
+        )
+
+        cache[oldKey] = configuration(for: .surge)
+        cache[currentKey] = configuration(for: .surge)
+
+        XCTAssertEqual(cache.count, 1)
+        XCTAssertNil(cache[oldKey])
+        XCTAssertEqual(cache[currentKey]?.target, .surge)
+    }
+
+    func testGenerationCacheSeparatesRuleSetPreference() {
+        var cache = ConfigurationCache()
+        let remoteKey = GenerationCacheKey(
+            target: .surge,
+            presetID: "rules",
+            nodesHash: 1,
+            countryCodesHash: 1,
+            preferRuleSets: true
+        )
+        let inlineKey = GenerationCacheKey(
+            target: .surge,
+            presetID: "rules",
+            nodesHash: 1,
+            countryCodesHash: 1,
+            preferRuleSets: false
+        )
+
+        cache[remoteKey] = GeneratedConfiguration(
+            target: .surge,
+            content: "RULE-SET,https://rules.example.com/list,Proxy",
+            supportedNodeCount: 1,
+            skippedNodeCount: 0,
+            ruleCount: 1
+        )
+        cache[inlineKey] = GeneratedConfiguration(
+            target: .surge,
+            content: "DOMAIN-SUFFIX,example.com,Proxy",
+            supportedNodeCount: 1,
+            skippedNodeCount: 0,
+            ruleCount: 1
+        )
+
+        XCTAssertNotEqual(cache[remoteKey]?.content, cache[inlineKey]?.content)
+    }
+
+    private func configuration(for target: ClientTarget) -> GeneratedConfiguration {
+        GeneratedConfiguration(
+            target: target,
+            content: "# test",
+            supportedNodeCount: 1,
+            skippedNodeCount: 0,
+            ruleCount: 1
+        )
+    }
+}
+
+private extension ExportPresentationTests {
+    func style(
+        at substring: String,
+        in content: String,
+        spans: [ConfigurationSyntaxHighlighter.Span]
+    ) -> ConfigurationSyntaxHighlighter.Style? {
+        let location = (content as NSString).range(of: substring).location
+        return spans.last { NSLocationInRange(location, $0.range) }?.style
+    }
+}
+
+private extension NSRange {
+    var nonEmpty: NSRange? {
+        location == NSNotFound || length == 0 ? nil : self
+    }
+}

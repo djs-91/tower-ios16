@@ -1,0 +1,517 @@
+import XCTest
+@testable import Tower
+
+final class DirectImportServiceTests: XCTestCase {
+    func testMacSubscriptionFallbackUsesInstalledSurgeCapability() {
+        XCTAssertTrue(MacClientImportCapability.copiesSubscription(target: .surgeMac, isMac: true, surgeSchemeAvailable: false))
+        XCTAssertFalse(MacClientImportCapability.copiesSubscription(target: .surgeMac, isMac: true, surgeSchemeAvailable: true))
+        XCTAssertTrue(MacClientImportCapability.copiesSubscription(target: .clashMac, isMac: true, surgeSchemeAvailable: true))
+        XCTAssertFalse(MacClientImportCapability.copiesSubscription(target: .surge, isMac: false, surgeSchemeAvailable: false))
+        XCTAssertFalse(MacClientImportCapability.copiesSubscription(target: .clashVerge, isMac: true, surgeSchemeAvailable: false))
+    }
+
+    func testMihomoPartyDedicatedSchemePreservesURLAndName() throws {
+        let source = try XCTUnwrap(URL(string: "http://127.0.0.1:65172/test.yaml?token=a&name=b"))
+        let result = try ClientImportURLBuilder.make(target: .mihomoParty, configurationURL: source, displayName: "塔台 & Test")
+        let components = try XCTUnwrap(URLComponents(url: result, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(result.scheme, "mihomo")
+        XCTAssertEqual(result.host, "install-config")
+        XCTAssertEqual(components.queryItems?.first { $0.name == "url" }?.value, source.absoluteString)
+        XCTAssertEqual(components.queryItems?.first { $0.name == "name" }?.value, "塔台 & Test")
+    }
+
+    @MainActor
+    func testFlClashUsesDedicatedSchemeAndPreservesNestedURL() throws {
+        let source = try XCTUnwrap(URL(string: "http://127.0.0.1:65172/test.yaml?token=a&name=b"))
+        let result = try ClientImportURLBuilder.make(target: .flClash, configurationURL: source)
+        XCTAssertEqual(result.scheme, "flclash")
+        XCTAssertEqual(result.host, "install-config")
+        XCTAssertEqual(URLComponents(url: result, resolvingAgainstBaseURL: false)?.queryItems?.first?.value, source.absoluteString)
+    }
+
+    @MainActor
+    func testVergeRefreshReadsUpdatedContentFromOriginalURL() async throws {
+        let service = DirectImportService()
+        defer { service.stop() }
+        func configuration(_ content: String) -> GeneratedConfiguration {
+            GeneratedConfiguration(target: .clashVerge, content: content,
+                supportedNodeCount: 1, skippedNodeCount: 0, ruleCount: 0, profileName: "Tower Refresh Test")
+        }
+        let firstScheme = try await service.prepare(configuration("proxies: []\n# first"))
+        let components = try XCTUnwrap(URLComponents(url: firstScheme, resolvingAgainstBaseURL: false))
+        let originalURL = try XCTUnwrap(URL(string: try XCTUnwrap(components.queryItems?.first { $0.name == "url" }?.value)))
+        let (firstData, _) = try await URLSession.shared.data(from: originalURL)
+        XCTAssertTrue(String(decoding: firstData, as: UTF8.self).contains("# first"))
+        let secondScheme = try await service.prepare(configuration("proxies: []\n# updated"))
+        XCTAssertEqual(firstScheme, secondScheme)
+        let (updatedData, response) = try await URLSession.shared.data(from: originalURL)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertTrue(String(decoding: updatedData, as: UTF8.self).contains("# updated"))
+    }
+
+    func testMacClientImportIdentityAndEncodedURL() throws {
+        let source = URL(string: "http://127.0.0.1:65172/config.yaml?token=a&target=clash")!
+        let url = try ClientImportURLBuilder.make(target: .clashVerge, configurationURL: source)
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(components.scheme, "clash-verge")
+        XCTAssertEqual(components.queryItems, [URLQueryItem(name: "url", value: source.absoluteString)])
+        XCTAssertTrue(ClientTarget.clashMac.usesClashFormat)
+        XCTAssertThrowsError(try ClientImportURLBuilder.make(target: .clashMac, configurationURL: source))
+        XCTAssertEqual(try ClientImportURLBuilder.make(target: .surgeMac, configurationURL: source).scheme, "surgeconfig")
+    }
+
+    func testLocalRouteAcceptsEquivalentUnicodeEscapesButNotDifferentTokens() {
+        let url = URL(string: "http://127.0.0.1:65172/塔台/private-token/塔台.yaml")!
+        let encoded = url.path(percentEncoded: true)
+        XCTAssertTrue(LocalConfigurationServer.matchesRequestPath(encoded, configurationURL: url))
+        XCTAssertTrue(LocalConfigurationServer.matchesRequestPath(encoded.lowercased(), configurationURL: url))
+        XCTAssertTrue(LocalConfigurationServer.matchesRequestPath(url.path(percentEncoded: false), configurationURL: url))
+        XCTAssertFalse(LocalConfigurationServer.matchesRequestPath(encoded.replacingOccurrences(of: "private-token", with: "other"), configurationURL: url))
+        XCTAssertFalse(LocalConfigurationServer.matchesRequestPath("/%invalid", configurationURL: url))
+    }
+
+    private let localURL = URL(string: "http://127.0.0.1:7788/private/tower.conf")!
+
+    func testBuildsDocumentedClientSchemes() throws {
+        let surge = try ClientImportURLBuilder.make(target: .surge, configurationURL: localURL)
+        let clash = try ClientImportURLBuilder.make(target: .clash, configurationURL: localURL)
+        let shadowrocket = try ClientImportURLBuilder.make(target: .shadowrocket, configurationURL: localURL)
+        let loon = try ClientImportURLBuilder.make(target: .loon, configurationURL: localURL)
+
+        XCTAssertEqual(surge.scheme, "surge")
+        XCTAssertTrue(surge.absoluteString.hasPrefix("surge:///install-config?url="))
+        XCTAssertTrue(clash.absoluteString.hasPrefix("stash://install-config?url="))
+        XCTAssertTrue(shadowrocket.absoluteString.hasPrefix("shadowrocket://config/add/http://127.0.0.1"))
+        XCTAssertTrue(loon.absoluteString.hasPrefix("loon://import?sub=http%3A%2F%2F127.0.0.1"))
+    }
+
+    func testClashAppUsesClashMetaInstallConfigSchemeWithOnlyTheSubscriptionURL() throws {
+        let target = try XCTUnwrap(ClientTarget(rawValue: "clash-apple"))
+
+        let url = try ClientImportURLBuilder.make(
+            target: target,
+            configurationURL: localURL,
+            displayName: "塔台"
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "clashmeta://install-config?url=http%3A%2F%2F127.0.0.1%3A7788%2Fprivate%2Ftower.conf"
+        )
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(components.queryItems, [URLQueryItem(name: "url", value: localURL.absoluteString)])
+    }
+
+    func testClashMiAndKaringUseTheirDocumentedNamedInstallRoutes() throws {
+        let expectedSchemes: [ClientTarget: String] = [
+            .clashMi: "clashmi",
+            .karing: "karing"
+        ]
+
+        for (target, scheme) in expectedSchemes {
+            let url = try ClientImportURLBuilder.make(
+                target: target,
+                configurationURL: localURL,
+                displayName: "塔台 配置"
+            )
+            let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+
+            XCTAssertEqual(components.scheme, scheme, target.name)
+            XCTAssertEqual(components.host, "install-config", target.name)
+            // Karing's copy carries a per-import revision; the resource is the same.
+            let served = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "url" })?.value)
+            XCTAssertTrue(served.hasPrefix(localURL.absoluteString), target.name)
+            // Karing also rejects a name it already has, so its copy is dated.
+            let name = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "name" })?.value)
+            XCTAssertTrue(target == .karing ? name.hasPrefix("塔台 配置 ") : name == "塔台 配置", "\(target.name): \(name)")
+        }
+    }
+
+    func testClashMiKeepsAStableRemoteIdentityAcrossExports() throws {
+        let first = try ClientImportURLBuilder.make(
+            target: .clashMi, configurationURL: localURL, displayName: "塔台", importRevision: "first"
+        )
+        let second = try ClientImportURLBuilder.make(
+            target: .clashMi, configurationURL: localURL, displayName: "塔台", importRevision: "second"
+        )
+        XCTAssertEqual(first, second, "Clash Mi 不应因重复导出创建新来源地址")
+    }
+
+    /// Karing skips a URL it already has instead of updating it, so a second
+    /// export only imported after the user deleted the first profile.
+    func testKaringGetsANewSourceURLForEachExport() throws {
+        let first = try ClientImportURLBuilder.make(
+            target: .karing, configurationURL: localURL, displayName: "塔台", importRevision: "first"
+        )
+        let second = try ClientImportURLBuilder.make(
+            target: .karing, configurationURL: localURL, displayName: "塔台", importRevision: "second"
+        )
+        XCTAssertNotEqual(first, second)
+        let dated = try ClientImportURLBuilder.make(
+            target: .karing, configurationURL: localURL, displayName: "塔台", importRevision: "x",
+            importDate: Date(timeIntervalSince1970: 0)
+        )
+        let name = URLComponents(url: dated, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "name" }?.value
+        XCTAssertNotNil(name?.range(of: #"^塔台 \d{2}-\d{2} \d{2}:\d{2}:\d{2}$"#, options: .regularExpression), name ?? "")
+        let served = try XCTUnwrap(URLComponents(url: first, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "url" }?.value)
+        let servedURL = try XCTUnwrap(URL(string: served))
+        // The local server drops the query before matching, so the same
+        // resource still answers.
+        XCTAssertEqual(servedURL.query, "tower-import=first")
+        XCTAssertTrue(LocalConfigurationServer.matchesRequestPath(
+            try XCTUnwrap(URLComponents(url: servedURL, resolvingAgainstBaseURL: false)?.percentEncodedPath),
+            configurationURL: localURL
+        ))
+    }
+
+    func testSingBoxMTUsesOfficialRemoteProfileImportScheme() throws {
+        let configurationURL = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:7788/private/%E5%A1%94%E5%8F%B0.json")
+        )
+
+        let url = try ClientImportURLBuilder.make(
+            target: .singBox,
+            configurationURL: configurationURL,
+            displayName: "塔台"
+        )
+
+        XCTAssertEqual(url.scheme, "sing-box")
+        XCTAssertEqual(url.host, "import-remote-profile")
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(
+            components.queryItems?.first(where: { $0.name == "url" })?.value,
+            configurationURL.absoluteString
+        )
+        XCTAssertEqual(components.fragment, "塔台")
+    }
+
+    func testStashUsesInstallConfigSchemeWithOnlyTheSubscriptionURL() throws {
+        let url = try ClientImportURLBuilder.make(
+            target: .clash,
+            configurationURL: localURL,
+            displayName: "塔台"
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "stash://install-config?url=http%3A%2F%2F127.0.0.1%3A7788%2Fprivate%2Ftower.conf"
+        )
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        XCTAssertEqual(components.queryItems, [URLQueryItem(name: "url", value: localURL.absoluteString)])
+    }
+
+    func testShadowrocketUsesDocumentedRawConfigurationURLPath() throws {
+        let url = try ClientImportURLBuilder.make(
+            target: .shadowrocket,
+            configurationURL: localURL
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "shadowrocket://config/add/http://127.0.0.1:7788/private/tower.conf"
+        )
+    }
+
+    func testQuanXDoesNotPretendToSupportFullConfigurationScheme() {
+        XCTAssertThrowsError(
+            try ClientImportURLBuilder.make(target: .quanx, configurationURL: localURL)
+        ) { error in
+            XCTAssertEqual(error as? DirectImportError, .unsupportedTarget(.quanx))
+        }
+    }
+
+    @MainActor
+    func testCopiedSurgeResourceUsesLoopbackAndCanBeUpdatedWithoutInstallingProfile() async throws {
+        let service = DirectImportService()
+        defer { service.stop() }
+        for target in [ClientTarget.surge, .surgeMac] {
+            func fixture(_ content: String) -> GeneratedConfiguration {
+                GeneratedConfiguration(target: target, content: content, supportedNodeCount: 1,
+                    skippedNodeCount: 0, ruleCount: 0, contentMode: .nodesOnly, fileExtensionOverride: "txt")
+            }
+            let first = try await service.prepareNodeSubscriptionURL(fixture("First = ss, first.example, 443"))
+            XCTAssertEqual(first.scheme, "http")
+            XCTAssertEqual(first.host, "127.0.0.1")
+            let (data, response) = try await URLSession.shared.data(from: first)
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            XCTAssertEqual(String(decoding: data, as: UTF8.self), "First = ss, first.example, 443")
+            let second = try await service.prepareNodeSubscriptionURL(fixture("Second = ss, second.example, 443"))
+            XCTAssertEqual(first, second)
+            let (updated, _) = try await URLSession.shared.data(from: first)
+            XCTAssertEqual(String(decoding: updated, as: UTF8.self), "Second = ss, second.example, 443")
+            let other = GeneratedConfiguration(target: .loon, content: "other dialect", supportedNodeCount: 1,
+                skippedNodeCount: 0, ruleCount: 0, contentMode: .nodesOnly, fileExtensionOverride: "txt")
+            _ = try await service.prepare(other)
+            let (_, oldResponse) = try await URLSession.shared.data(from: first)
+            XCTAssertEqual((oldResponse as? HTTPURLResponse)?.statusCode, 404)
+        }
+    }
+
+    func testSurgeNodeModeCopiesResourceInsteadOfInstallingAProfile() {
+        for target in [ClientTarget.surge, .surgeMac] {
+            XCTAssertEqual(target.supportedContentModes, [.fullConfiguration, .nodesOnly])
+            XCTAssertTrue(target.copiesAggregatedSubscription(mode: .nodesOnly))
+            XCTAssertFalse(target.copiesAggregatedSubscription(mode: .fullConfiguration))
+            XCTAssertTrue(target.supportsDirectImport(mode: .fullConfiguration))
+            XCTAssertFalse(target.supportsDirectImport(mode: .nodesOnly))
+            XCTAssertThrowsError(try ClientImportURLBuilder.make(target: target,
+                configurationURL: localURL, contentMode: .nodesOnly))
+        }
+        XCTAssertFalse(ClientTarget.shadowrocket.copiesAggregatedSubscription(mode: .nodesOnly))
+    }
+
+    func testNodeOnlySchemesKeepExistingClientRules() throws {
+        let shadowrocket = try ClientImportURLBuilder.make(
+            target: .shadowrocket,
+            configurationURL: localURL,
+            displayName: "塔台",
+            contentMode: .nodesOnly
+        )
+        let loon = try ClientImportURLBuilder.make(
+            target: .loon,
+            configurationURL: localURL,
+            displayName: "塔台",
+            contentMode: .nodesOnly
+        )
+        let quanx = try ClientImportURLBuilder.make(
+            target: .quanx,
+            configurationURL: localURL,
+            displayName: "塔台节点",
+            contentMode: .nodesOnly
+        )
+        let hiddify = try ClientImportURLBuilder.make(
+            target: .hiddify,
+            configurationURL: localURL,
+            displayName: "塔台",
+            contentMode: .nodesOnly
+        )
+
+        XCTAssertTrue(shadowrocket.absoluteString.hasPrefix("shadowrocket://add/"))
+        XCTAssertTrue(shadowrocket.absoluteString.hasSuffix("#%E5%A1%94%E5%8F%B0"))
+        XCTAssertTrue(loon.absoluteString.hasPrefix("loon://import?nodelist=http%3A%2F%2F127.0.0.1"))
+        XCTAssertTrue(quanx.absoluteString.hasPrefix("quantumult-x:///add-resource?remote-resource="))
+        XCTAssertTrue(hiddify.absoluteString.hasPrefix("hiddify://import/http://127.0.0.1"))
+        XCTAssertNil(hiddify.fragment, "Hiddify 的名称由 Profile-Title 响应头传递，URL 片段不能显示成百分号乱码")
+    }
+
+    func testV2BoxUsesDocumentedSubscriptionSchemeWithEncodedValues() throws {
+        let target = try XCTUnwrap(ClientTarget(rawValue: "v2box"))
+        let configurationURL = try XCTUnwrap(
+            URL(string: "http://127.0.0.1:7788/private/塔台.txt?token=a&revision=1")
+        )
+
+        let url = try ClientImportURLBuilder.make(
+            target: target,
+            configurationURL: configurationURL,
+            displayName: "塔台 节点",
+            contentMode: .nodesOnly
+        )
+
+        XCTAssertEqual(url.scheme, "v2box")
+        XCTAssertEqual(url.host, "install-sub")
+        let queryItems = try XCTUnwrap(
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        )
+        XCTAssertEqual(
+            queryItems.first(where: { $0.name == "url" })?.value,
+            configurationURL.absoluteString
+        )
+        XCTAssertEqual(queryItems.first(where: { $0.name == "name" })?.value, "塔台 节点")
+    }
+
+    func testLoonNodeImportUsesNamedRefreshableResourceURL() throws {
+        let first = try ClientImportURLBuilder.make(
+            target: .loon,
+            configurationURL: localURL,
+            displayName: "塔台",
+            contentMode: .nodesOnly,
+            importRevision: "first"
+        )
+        let second = try ClientImportURLBuilder.make(
+            target: .loon,
+            configurationURL: localURL,
+            displayName: "塔台",
+            contentMode: .nodesOnly,
+            importRevision: "second"
+        )
+
+        XCTAssertNotEqual(first, second, "重复点击必须生成可重新添加的 Loon 资源地址")
+        XCTAssertTrue(first.absoluteString.contains("tower-import%3Dfirst"), first.absoluteString)
+    }
+
+    func testQuanXOnlyOffersNodeResourceImportBecausePoliciesAreNotRemoteResources() throws {
+        let nodes = try ClientImportURLBuilder.make(
+            target: .quanx,
+            configurationURL: localURL,
+            displayName: "塔台",
+            contentMode: .nodesOnly
+        )
+        let nodeJSON = try decodedQuanXResource(nodes)
+        XCTAssertNotNil(nodeJSON["server_remote"])
+        XCTAssertNil(nodeJSON["filter_remote"])
+        XCTAssertTrue(nodeJSON["server_remote"]?.first?.contains("as-policy=static") == true)
+        // Quantumult X offers node and filter resources but no way to carry a
+        // [policy] section, so a complete configuration is never presented as a
+        // one-click import for it.
+        XCTAssertEqual(ClientTarget.quanx.supportedContentModes, [.fullConfiguration, .nodesOnly])
+        XCTAssertFalse(ClientTarget.quanx.supportsDirectImport(mode: .fullConfiguration))
+        XCTAssertThrowsError(
+            try ClientImportURLBuilder.make(
+                target: .quanx,
+                configurationURL: localURL,
+                contentMode: .fullConfiguration
+            )
+        )
+    }
+
+    func testLoopbackServerServesGeneratedConfiguration() async throws {
+        let configuration = GeneratedConfiguration(
+            target: .surge,
+            content: "# Tower loopback test\n[General]\nloglevel = notify\n",
+            supportedNodeCount: 1,
+            skippedNodeCount: 0,
+            ruleCount: 0,
+            profileName: "塔台"
+        )
+        let server = LocalConfigurationServer(configuration: configuration)
+        let url = try await server.start()
+        defer { server.stop() }
+
+        let (data, response) = try await URLSession.shared.data(from: url)
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), configuration.content)
+        XCTAssertEqual((response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Cache-Control"), "no-store")
+        XCTAssertEqual(
+            (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Profile-Title"),
+            "base64:\(Data("塔台".utf8).base64EncodedString())"
+        )
+        XCTAssertTrue(
+            (response as? HTTPURLResponse)?
+                .value(forHTTPHeaderField: "Content-Disposition")?
+                .contains("filename*=UTF-8''") == true
+        )
+
+        var refreshComponents = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        refreshComponents.queryItems = [URLQueryItem(name: "tower-import", value: "second-import")]
+        let refreshURL = try XCTUnwrap(refreshComponents.url)
+        let (refreshData, refreshResponse) = try await URLSession.shared.data(from: refreshURL)
+        XCTAssertEqual((refreshResponse as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(String(decoding: refreshData, as: UTF8.self), configuration.content)
+    }
+
+    func testOneTapImportKeepsTheSameProtectedLocalURLAcrossExports() throws {
+        let suiteName = "tower-direct-import-token-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let token = DirectImportAccessTokenStore.loadOrCreate(defaults: defaults)
+        XCTAssertEqual(DirectImportAccessTokenStore.loadOrCreate(defaults: defaults), token)
+
+        let configuration = GeneratedConfiguration(
+            target: .clash,
+            content: "# stable import",
+            supportedNodeCount: 1,
+            skippedNodeCount: 0,
+            ruleCount: 0
+        )
+        let first = LocalConfigurationServer(configuration: configuration, token: token)
+        let second = LocalConfigurationServer(configuration: configuration, token: token)
+
+        XCTAssertEqual(first.configurationURL, second.configurationURL)
+        XCTAssertEqual(first.configurationURL.host, "127.0.0.1")
+        XCTAssertEqual(first.configurationURL.port, 65_172)
+        XCTAssertEqual(
+            first.configurationURL.path,
+            "/\(configuration.profileName)/\(token)/\(configuration.fileName)"
+        )
+    }
+}
+
+private extension DirectImportServiceTests {
+    func decodedQuanXResource(_ url: URL) throws -> [String: [String]] {
+        let components = try XCTUnwrap(URLComponents(url: url, resolvingAgainstBaseURL: false))
+        let encoded = try XCTUnwrap(components.queryItems?.first(where: { $0.name == "remote-resource" })?.value)
+        let data = try XCTUnwrap(encoded.data(using: .utf8))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: [String]])
+    }
+}
+
+/// Egern documents `egern:/profiles/new?name=&url=` — one slash, so the path
+/// carries no authority component.
+extension DirectImportServiceTests {
+    func testEgernUsesItsDocumentedProfileScheme() throws {
+        let localURL = URL(string: "http://127.0.0.1:8080/token/塔台-Egern.yaml")!
+
+        let url = try ClientImportURLBuilder.make(target: .egern, configurationURL: localURL)
+
+        XCTAssertEqual(url.scheme, "egern")
+        XCTAssertNil(url.host, "egern:/… 没有 authority 段")
+        XCTAssertEqual(url.path, "/profiles/new")
+        let query = try XCTUnwrap(url.query)
+        XCTAssertTrue(query.contains("url="), query)
+        XCTAssertFalse(query.contains("127.0.0.1:8080/token"), "配置地址必须转义")
+    }
+
+    func testEgernIsOfferedAsOneTapImport() {
+        XCTAssertTrue(ClientTarget.egern.supportsDirectConfigurationImport)
+    }
+}
+
+/// Hiddify's parser bails on `!uri.hasAuthority`, so its link needs the two
+/// slashes Egern's must not have. Both forms are pinned so neither gets
+/// "corrected" into the other.
+extension DirectImportServiceTests {
+    func testHiddifyUsesCurrentUnifiedImportRoute() throws {
+        let localURL = URL(string: "http://127.0.0.1:8080/token/塔台-Hiddify.json")!
+
+        let url = try ClientImportURLBuilder.make(target: .hiddify, configurationURL: localURL)
+
+        XCTAssertEqual(url.scheme, "hiddify")
+        XCTAssertEqual(url.host, "import")
+        XCTAssertTrue(url.path.contains("http://127.0.0.1:8080/token"), url.absoluteString)
+    }
+
+    func testEgernAndHiddifyUseTheirDocumentedRoutes() throws {
+        let localURL = URL(string: "http://127.0.0.1:8080/token/c.yaml")!
+
+        let egern = try ClientImportURLBuilder.make(target: .egern, configurationURL: localURL)
+        let hiddify = try ClientImportURLBuilder.make(target: .hiddify, configurationURL: localURL)
+
+        XCTAssertNil(egern.host)
+        XCTAssertNotNil(hiddify.host)
+    }
+
+    func testFileOnlyClientsDoNotAdvertiseAFullConfigurationScheme() {
+        let withoutScheme = ClientTarget.allCases.filter { !$0.supportsDirectConfigurationImport }
+        XCTAssertEqual(withoutScheme, [.quanx, .v2box, .anywhere, .clashMac])
+    }
+}
+
+/// The served file has to look like what the client expects. Hiddify was being
+/// handed a sing-box JSON document named `tower.conf` as text/plain.
+extension DirectImportServiceTests {
+    func testServedFileMatchesTheTargetFormat() {
+        let expected: [ClientTarget: String] = [
+            .clash: "application/yaml",
+            .clashApple: "application/yaml",
+            .clashMi: "application/yaml",
+            .karing: "application/yaml",
+            .egern: "application/yaml",
+            .hiddify: "application/json",
+            .singBox: "application/json",
+            .surge: "text/plain"
+        ]
+
+        for (target, type) in expected {
+            let configuration = GeneratedConfiguration(
+                target: target, content: "x", supportedNodeCount: 1,
+                skippedNodeCount: 0, ruleCount: 0
+            )
+            let server = LocalConfigurationServer(configuration: configuration)
+
+            XCTAssertEqual(server.servedFileName, configuration.fileName, target.name)
+            XCTAssertTrue(server.servedContentType.hasPrefix(type), "\(target.name): \(server.servedContentType)")
+        }
+    }
+}

@@ -1,0 +1,1435 @@
+import Darwin
+import Foundation
+
+/// A rule scheme loaded from Clash YAML, subconverter `.ini`, or Surge config.
+/// Unlike `RulePreset`, whose policy groups are fixed in Swift, an imported
+/// scheme carries whatever groups the file declared, so generation reproduces
+/// the source faithfully.
+struct RuleScheme: Identifiable, Codable, Hashable {
+    let id: String
+    var name: String
+    var summary: String
+    var sourceURLString: String?
+    /// The exact text last imported or saved in the manual editor. Older
+    /// snapshots legitimately have no copy; the editor renders a canonical
+    /// subconverter document from the parsed model in that case.
+    var rawConfigurationText: String?
+    /// Target-neutral network preferences extracted from the source document.
+    /// Each exporter maps only the fields its client understands.
+    var networkSettings: RuleSchemeNetworkSettings?
+    var groups: [RuleSchemeGroup]
+    var rulesets: [RuleSchemeRuleset]
+    var updatedAt: Date?
+    /// Missing keeps the legacy imported-source description, while `true`
+    /// means the user deliberately replaced that automatic copy.
+    var summaryIsUserEdited: Bool?
+    /// True for the schemes shipped inside the app bundle, which work offline
+    /// and cannot be deleted.
+    var isBundled: Bool
+
+    init(
+        id: String,
+        name: String,
+        summary: String,
+        sourceURLString: String? = nil,
+        groups: [RuleSchemeGroup],
+        rulesets: [RuleSchemeRuleset],
+        rawConfigurationText: String? = nil,
+        networkSettings: RuleSchemeNetworkSettings? = nil,
+        updatedAt: Date? = nil,
+        summaryIsUserEdited: Bool? = nil,
+        isBundled: Bool = false
+    ) {
+        self.id = id
+        self.name = name
+        self.summary = summary
+        self.sourceURLString = sourceURLString
+        self.rawConfigurationText = rawConfigurationText
+        self.networkSettings = networkSettings
+        self.groups = groups
+        self.rulesets = rulesets
+        self.updatedAt = updatedAt
+        self.summaryIsUserEdited = summaryIsUserEdited
+        self.isBundled = isBundled
+    }
+
+    /// Every remote list the scheme references, de-duplicated in first-use order.
+    var remoteRulesetURLs: [URL] {
+        var seen = Set<String>()
+        return rulesets.compactMap { ruleset in
+            // A binary MRS list cannot be read here; mihomo clients fetch it
+            // themselves and the others are told it was left out.
+            guard !ruleset.isBinaryRuleSet,
+                  let url = ruleset.resource.downloadURL,
+                  seen.insert(url.absoluteString).inserted else { return nil }
+            return url
+        }
+    }
+
+    /// Imported summaries used to be localized before being persisted. Derive
+    /// the generic source description at display time so changing the app
+    /// language also fixes schemes saved by older builds.
+    func localizedSummary(bundle: Bundle = .main) -> String {
+        guard summaryIsUserEdited != true,
+              !isBundled,
+              let sourceURLString,
+              let host = URL(string: sourceURLString)?.host else {
+            return summary
+        }
+        return String(localized: "从 \(host) 导入", bundle: bundle)
+    }
+
+    /// The group a client should fall back to, taken from the `[]FINAL` ruleset.
+    var finalGroupName: String? {
+        rulesets.first { ruleset in
+            if case .inline(let rule) = ruleset.resource {
+                return rule.uppercased() == "FINAL"
+            }
+            return false
+        }?.groupName
+    }
+
+    /// Only groups that own non-final rules are user-facing choices. Routing
+    /// primitives such as node selectors and regional URL tests are pulled in
+    /// automatically through group references.
+    var selectableRuleGroupNames: [String] {
+        var seen = Set<String>()
+        return rulesets.compactMap { ruleset in
+            if case .inline(let rule) = ruleset.resource, rule.uppercased() == "FINAL" {
+                return nil
+            }
+            return seen.insert(ruleset.groupName).inserted ? ruleset.groupName : nil
+        }
+    }
+
+    /// Routing primitives that define the shape of a valid configuration are
+    /// shown for context but are never user-removable. The final policy is
+    /// detected structurally; common direct/reject groups are recognised by
+    /// their source names after decorative emoji are removed.
+    var protectedRuleGroupNames: [String] {
+        let finalName = finalGroupName
+        let fixedNames: Set<String> = [
+            "全球直连", "全球拦截", "漏网之鱼",
+            "global direct", "global reject", "final", "final match",
+        ]
+        return groups.compactMap { group in
+            let key = Self.removingLeadingEmoji(from: group.name)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            return group.name == finalName || fixedNames.contains(key) ? group.name : nil
+        }
+    }
+
+    var editableRuleGroupNames: [String] {
+        let protectedNames = Set(protectedRuleGroupNames)
+        return selectableRuleGroupNames.filter { !protectedNames.contains($0) }
+    }
+
+    /// The policy-group editor has two deliberately separate jobs. Service
+    /// rules choose an outbound policy, while regional/helper groups define
+    /// which node names they contain. Mixing the two makes service rules appear
+    /// as candidates for one another and can create cyclic configurations.
+    func groupEditorMode(for group: RuleSchemeGroup) -> RuleSchemeGroupEditorMode {
+        if group.kind == .smart || group.isCustomNodeFilter == true { return .nodePatternsOnly }
+        if isPrimaryNodeSelector(group.name) {
+            return .routingTargets
+        }
+
+        let declaredRuleGroups = Set(rulesets.map(\.groupName))
+        let hasNodePattern = group.members.contains { member in
+            if case .nodePattern = member { return true }
+            return false
+        }
+        return hasNodePattern && !declaredRuleGroups.contains(group.name)
+            ? .nodePatternsOnly
+            : .routingTargets
+    }
+
+    /// Only general-purpose outbound policies belong in a service rule's
+    /// candidate list. Other service rules (AI, Netflix, Apple, media, etc.)
+    /// are routing rules, not destinations, and must never be offered here.
+    func routingTargetGroupNames(
+        from candidateGroups: [RuleSchemeGroup]? = nil,
+        excluding excludedName: String? = nil
+    ) -> [String] {
+        let candidateGroups = candidateGroups ?? groups
+        var seen = Set<String>()
+        let declaredCore = candidateGroups.compactMap { group -> String? in
+            guard group.name != excludedName,
+                  isCoreRoutingTarget(group.name) else { return nil }
+            return group.name
+        }
+        let declaredRegions = Dictionary(
+            candidateGroups.compactMap { group -> (SupplementalRoutingRegion, String)? in
+                guard group.name != excludedName,
+                      let region = Self.routingRegion(for: group.name) else { return nil }
+                return (region, group.name)
+            },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let regionalTargets = SupplementalRoutingRegion.allCases.map { region in
+            declaredRegions[region] ?? region.canonicalName
+        }
+        let manualTargets = candidateGroups.contains { Self.isManualRoutingTarget($0.name) }
+            || excludedName.map(Self.isManualRoutingTarget) == true
+            ? [] : ["🚀 手动切换"]
+        let customTargets = candidateGroups.filter { $0.isCustomNodeFilter == true && $0.name != excludedName }.map(\.name)
+        return (declaredCore + manualTargets + regionalTargets + customTargets + ["DIRECT", "REJECT"])
+            .filter { seen.insert($0).inserted }
+    }
+
+    /// Produces a valid, self-contained view of this scheme for generation.
+    /// An explicit selection filters service rules, while the final policy and
+    /// every transitively referenced helper group remain available.
+    func customized(
+        enabledRuleGroupNames: Set<String>?,
+        customRuleFlows: [CustomRuleFlow],
+        groupCustomization: RuleSchemeCustomization? = nil,
+        resolvedRuleLines: [URL: [String]] = [:]
+    ) -> RuleScheme {
+        let enabledFlows = customRuleFlows.filter { $0.schemeID == id && $0.isEnabled }
+        let supplementFlows = enabledFlows.filter { $0.isGroupSupplement == true }
+        let candidateFlows = enabledFlows.filter { $0.isGroupSupplement != true }
+        var availableGroups = groups
+        for group in groupCustomization?.addedNodeGroups ?? [] {
+            availableGroups.removeAll { $0.name == group.name }
+            availableGroups.append(group)
+        }
+        var availableGroupNames = Set(availableGroups.map(\.name))
+        var insertedGeneratedRuleSetIDs = Set<UUID>()
+        for flow in candidateFlows {
+            guard let group = flow.expansion.policyGroup,
+                  availableGroupNames.insert(group.name).inserted else { continue }
+            availableGroups.append(group)
+            insertedGeneratedRuleSetIDs.insert(flow.id)
+        }
+        availableGroups = groupCustomization?.applying(to: availableGroups) ?? availableGroups
+        availableGroups = Self.injectMissingRoutingGroups(into: availableGroups, customization: groupCustomization)
+
+        let groupNames = Set(availableGroups.map(\.name))
+        let validPolicies = groupNames.union(RoutingBuiltinPolicies.names)
+        let expansions = candidateFlows.map { flow in
+            groupCustomization?.applying(to: flow.expansion) ?? flow.expansion
+        }.filter {
+            validPolicies.contains($0.binding.policyGroupName)
+        }
+
+        var ordinaryRulesets: [RuleSchemeRuleset] = []
+        var finalRulesets: [RuleSchemeRuleset] = []
+        let removedGroupNames = groupCustomization?.removedGroupNames ?? []
+        for sourceRuleset in rulesets {
+            let ruleset = RuleSchemeRuleset(
+                groupName: groupCustomization?.renamedGroupName(sourceRuleset.groupName)
+                    ?? sourceRuleset.groupName,
+                resource: sourceRuleset.resource, options: sourceRuleset.options, provider: sourceRuleset.provider
+            )
+            guard !removedGroupNames.contains(ruleset.groupName) else { continue }
+            if case .inline(let rule) = ruleset.resource, rule.uppercased() == "FINAL" {
+                finalRulesets.append(ruleset)
+            } else if RoutingBuiltinPolicies.names.contains(ruleset.groupName) || (enabledRuleGroupNames?.contains(ruleset.groupName) ?? true) {
+                ordinaryRulesets.append(ruleset)
+            }
+        }
+
+        var customRulesetsByInsertion = Array(
+            repeating: [RuleSchemeRuleset](),
+            count: ordinaryRulesets.count + 1
+        )
+        let explicitlyOrderedGroupNames = Set(groupCustomization?.groupOrder ?? [])
+        var generatedGroupPlacements: [(groupName: String, anchorName: String?)] = []
+        for expansion in expansions {
+            let policyGroupName = expansion.binding.policyGroupName
+            var expansionRulesets: [RuleSchemeRuleset] = []
+            if let url = expansion.ruleSet.remoteURL {
+                expansionRulesets.append(
+                    RuleSchemeRuleset(groupName: policyGroupName, resource: .remote(url))
+                )
+            }
+            expansionRulesets.append(contentsOf: expansion.ruleSet.inlineRules.enumerated().map { index, body in
+                let explicitPolicy = expansion.ruleSet.inlinePolicies.indices.contains(index)
+                    ? expansion.ruleSet.inlinePolicies[index] : nil
+                return RuleSchemeRuleset(groupName: explicitPolicy ?? policyGroupName, resource: .inline(body))
+            })
+            expansionRulesets = expansionRulesets.map {
+                var ruleset = $0
+                ruleset.origin = .added(expansion.ruleSet.name)
+                return ruleset
+            }
+            let insertion = Self.customRulesetInsertionIndex(
+                for: expansion,
+                in: ordinaryRulesets,
+                resolvedRuleLines: resolvedRuleLines
+            )
+            customRulesetsByInsertion[insertion].append(contentsOf: expansionRulesets)
+            if let groupName = expansion.policyGroup?.name,
+               insertedGeneratedRuleSetIDs.contains(expansion.ruleSet.id),
+               !explicitlyOrderedGroupNames.contains(groupName) {
+                generatedGroupPlacements.append(
+                    (
+                        groupName: groupName,
+                        anchorName: insertion < ordinaryRulesets.count
+                            ? ordinaryRulesets[insertion].groupName
+                            : finalRulesets.first?.groupName
+                    )
+                )
+            }
+        }
+
+        var mergedRulesets: [RuleSchemeRuleset] = []
+        for index in ordinaryRulesets.indices {
+            mergedRulesets.append(contentsOf: customRulesetsByInsertion[index])
+            mergedRulesets.append(ordinaryRulesets[index])
+        }
+        mergedRulesets.append(contentsOf: customRulesetsByInsertion[ordinaryRulesets.count])
+        if let order = groupCustomization?.matchingOrder, !order.isEmpty {
+            mergedRulesets = Self.reordering(mergedRulesets, by: order)
+        }
+
+        for placement in generatedGroupPlacements {
+            guard let currentIndex = availableGroups.firstIndex(where: {
+                $0.name == placement.groupName
+            }) else { continue }
+            let group = availableGroups.remove(at: currentIndex)
+            guard let anchorName = placement.anchorName,
+                  let anchorIndex = availableGroups.firstIndex(where: {
+                      $0.name == anchorName
+                  }) else {
+                availableGroups.append(group)
+                continue
+            }
+            availableGroups.insert(group, at: anchorIndex)
+        }
+
+        var result = self
+        result.groups = availableGroups
+        // Matching order is the source's, with added rules ahead of the first
+        // rule they overlap, and a dragged group moved as one block
+        // (`reordering`). `groupOrder` itself is never applied to the rules:
+        // doing that put 🚀 节点选择's GFW list ahead of AI, Netflix, direct
+        // and ad-block lists after any drag (issue #40). Conditions the user
+        // attached to a group come before all of it (issue #45).
+        result.rulesets = Self.supplementRulesets(
+            from: supplementFlows,
+            customization: groupCustomization,
+            validPolicies: validPolicies.subtracting(removedGroupNames)
+        ) + mergedRulesets + finalRulesets
+        if groupCustomization?.overridesNetworkSettings == true {
+            result.networkSettings = groupCustomization?.networkSettingsOverride
+        }
+
+        // Nil means the untouched default: reproduce every group exactly as
+        // the source declared it. Explicit selections may safely prune groups.
+        guard enabledRuleGroupNames != nil else { return result }
+
+        var requiredNames = Set(result.rulesets.map(\.groupName)).intersection(groupNames)
+        var didAddDependency = true
+        while didAddDependency {
+            didAddDependency = false
+            for group in availableGroups where requiredNames.contains(group.name) {
+                for member in group.members {
+                    guard case .reference(let name) = member,
+                          groupNames.contains(name),
+                          requiredNames.insert(name).inserted else { continue }
+                    didAddDependency = true
+                }
+            }
+        }
+        result.groups = availableGroups.filter { requiredNames.contains($0.name) }
+        return result
+    }
+
+    /// Rule groups in the order a client first reaches them.
+    static func matchingGroupNames(of rulesets: [RuleSchemeRuleset]) -> [String] {
+        var seen = Set<String>()
+        return rulesets.compactMap { ruleset in
+            if case .inline(let rule) = ruleset.resource, rule.uppercased() == "FINAL" { return nil }
+            guard ruleset.origin != .supplement,
+                  !RoutingBuiltinPolicies.names.contains(ruleset.groupName),
+                  seen.insert(ruleset.groupName).inserted else { return nil }
+            return ruleset.groupName
+        }
+    }
+
+    /// Applies a dragged matching order while touching as little as
+    /// possible. Groups whose relative order the user kept (the longest
+    /// subsequence still in source order) stay exactly where the source put
+    /// each of their rules; only the groups that were moved are lifted out as
+    /// one block and placed right before the next unmoved group. A trailing
+    /// `GEOIP` fallback stays put, so moving 🎯 全球直连 does not make every
+    /// unmatched domain resolve early.
+    static func reordering(_ rulesets: [RuleSchemeRuleset], by order: [String]) -> [RuleSchemeRuleset] {
+        let sourceOrder = matchingGroupNames(of: rulesets)
+        let rank = Dictionary(uniqueKeysWithValues: sourceOrder.enumerated().map { ($1, $0) })
+        var seen = Set<String>()
+        let desired = order.filter { rank[$0] != nil && seen.insert($0).inserted }
+        guard desired.count > 1 else { return rulesets }
+
+        let kept = Set(longestIncreasingSubsequence(desired.map { rank[$0] ?? 0 }).map { desired[$0] })
+        let movedNames = Set(desired.filter { !kept.contains($0) })
+        guard !movedNames.isEmpty else { return rulesets }
+        func isAnchored(_ ruleset: RuleSchemeRuleset) -> Bool {
+            guard case .inline(let rule) = ruleset.resource else { return false }
+            return rule.uppercased().hasPrefix("GEOIP,")
+        }
+        func lifts(_ ruleset: RuleSchemeRuleset) -> Bool {
+            ruleset.origin != .supplement && movedNames.contains(ruleset.groupName) && !isAnchored(ruleset)
+        }
+
+        var blocks: [String: [RuleSchemeRuleset]] = [:]
+        for ruleset in rulesets where lifts(ruleset) {
+            blocks[ruleset.groupName, default: []].append(ruleset)
+        }
+        // Each moved group lands before the next group after it that stayed;
+        // one dragged past every kept group lands right after the last of
+        // them, still ahead of the trailing GEOIP fallback.
+        var pending: [String: [RuleSchemeRuleset]] = [:]
+        var trailing: [RuleSchemeRuleset] = []
+        for (index, name) in desired.enumerated() where movedNames.contains(name) {
+            let block = blocks[name] ?? []
+            if let anchor = desired[(index + 1)...].first(where: kept.contains) {
+                pending[anchor, default: []].append(contentsOf: block)
+            } else {
+                trailing.append(contentsOf: block)
+            }
+        }
+
+        var result: [RuleSchemeRuleset] = []
+        for ruleset in rulesets where !lifts(ruleset) {
+            if ruleset.origin != .supplement, let block = pending.removeValue(forKey: ruleset.groupName) {
+                result.append(contentsOf: block)
+            }
+            result.append(ruleset)
+        }
+        guard !trailing.isEmpty else { return result }
+        let lastKept = desired.last(where: kept.contains)
+        let insertion = result.lastIndex { !isAnchored($0) && $0.groupName == lastKept }
+            .map { $0 + 1 } ?? result.endIndex
+        result.insert(contentsOf: trailing, at: insertion)
+        return result
+    }
+
+    /// Indices of one longest strictly increasing subsequence.
+    private static func longestIncreasingSubsequence(_ values: [Int]) -> [Int] {
+        var tails: [Int] = []
+        var previous = Array(repeating: -1, count: values.count)
+        for (index, value) in values.enumerated() {
+            var low = 0, high = tails.count
+            while low < high {
+                let middle = (low + high) / 2
+                if values[tails[middle]] < value { low = middle + 1 } else { high = middle }
+            }
+            if low > 0 { previous[index] = tails[low - 1] }
+            if low == tails.count { tails.append(index) } else { tails[low] = index }
+        }
+        var result: [Int] = []
+        var cursor = tails.last ?? -1
+        while cursor >= 0 {
+            result.append(cursor)
+            cursor = previous[cursor]
+        }
+        return result.reversed()
+    }
+
+    /// Most specific first, then in the order they were added. A condition
+    /// already claimed by an earlier group is not emitted twice.
+    static func supplementRulesets(
+        from flows: [CustomRuleFlow],
+        customization: RuleSchemeCustomization?,
+        validPolicies: Set<String>
+    ) -> [RuleSchemeRuleset] {
+        let entries = flows.flatMap { flow -> [(rule: SupplementRule, policy: String)] in
+            let policy = customization?.renamedGroupName(flow.policyName) ?? flow.policyName
+            guard validPolicies.contains(policy) else { return [] }
+            return flow.supplementRules.map { ($0, policy) }
+        }
+        var seen = Set<String>()
+        return entries.enumerated().sorted { lhs, rhs in
+            if SupplementRule.matchingOrder(lhs.element.rule, rhs.element.rule) { return true }
+            if SupplementRule.matchingOrder(rhs.element.rule, lhs.element.rule) { return false }
+            return lhs.offset < rhs.offset
+        }.compactMap { entry in
+            guard seen.insert(entry.element.rule.line.lowercased()).inserted else { return nil }
+            return RuleSchemeRuleset(
+                groupName: entry.element.policy,
+                resource: .inline(entry.element.rule.line),
+                origin: .supplement
+            )
+        }
+    }
+
+    private static func customRulesetInsertionIndex(
+        for expansion: CustomRuleFlowExpansion,
+        in upstreamRulesets: [RuleSchemeRuleset],
+        resolvedRuleLines: [URL: [String]]
+    ) -> Int {
+        let customGroup = normalizedPolicyName(expansion.binding.policyGroupName)
+        let customURL = expansion.ruleSet.remoteURL
+        var customLines = expansion.ruleSet.inlineRules
+        if let customURL {
+            customLines.append(contentsOf: resolvedRuleLines[customURL] ?? [])
+        }
+        let customMatches = Set(customLines.compactMap(ruleMatchKey))
+
+        return upstreamRulesets.firstIndex { upstream in
+            if normalizedPolicyName(upstream.groupName) == customGroup {
+                return true
+            }
+            switch upstream.resource {
+            case .remote(let url):
+                if url == customURL { return true }
+                let upstreamMatches = Set(
+                    (resolvedRuleLines[url] ?? []).compactMap(ruleMatchKey)
+                )
+                return !customMatches.isDisjoint(with: upstreamMatches)
+            case .inline(let rule):
+                guard let match = ruleMatchKey(rule) else { return false }
+                return customMatches.contains(match)
+            }
+        } ?? upstreamRulesets.count
+    }
+
+    private static func ruleMatchKey(_ rawRule: String) -> String? {
+        let parts = rawRule.split(separator: ",", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard parts.count >= 2, !parts[0].isEmpty, !parts[1].isEmpty else { return nil }
+        return [parts[0].uppercased(), parts[1].lowercased()].joined(separator: ",")
+    }
+
+    /// Hides decorative leading emoji, or with `autofill` adds a recognised
+    /// one where a group has none, without breaking the graph between policy
+    /// groups and rules. Every declaration and reference is renamed together.
+    func withGroupEmojis(_ enabled: Bool, autofill: Bool = false) -> RuleScheme {
+        guard enabled else { return renamingGroups(Self.withoutEmoji(groups.map(\.name))) }
+        guard autofill else { return self }
+        // Only names something recognises; an unknown name keeps no emoji.
+        let filled = Dictionary(groups.compactMap { group -> (String, String)? in
+            guard PolicyGroupEmoji.leading(in: group.name) == nil,
+                  let emoji = PolicyGroupEmoji.recognized(for: group, in: self) else { return nil }
+            return (group.name, "\(emoji) \(group.name)")
+        }, uniquingKeysWith: { first, _ in first })
+        let taken = Set(groups.map(\.name))
+        return renamingGroups(filled.filter { !taken.contains($0.value) })
+    }
+
+    /// For clients that draw a group's icon themselves: names without their
+    /// leading emoji, and the emoji each renamed group had, by new name.
+    func withoutGroupEmojis(only selected: Set<String>? = nil) -> (scheme: RuleScheme, renamed: [String: String]) {
+        let names = Self.withoutEmoji(groups.map(\.name)).filter { selected?.contains($0.key) ?? true }
+        return (renamingGroups(names), names)
+    }
+
+    /// Removing decoration that would leave two groups with one name keeps
+    /// both source names instead, so no reference becomes ambiguous.
+    private static func withoutEmoji(_ names: [String]) -> [String: String] {
+        let candidates = names.map { ($0, removingLeadingEmoji(from: $0)) }
+        let counts = Dictionary(grouping: candidates, by: \.1).mapValues(\.count)
+        return Dictionary(candidates.compactMap { original, candidate in
+            counts[candidate] == 1 && candidate != original ? (original, candidate) : nil
+        }, uniquingKeysWith: { first, _ in first })
+    }
+
+    func renamingGroups(_ names: [String: String]) -> RuleScheme {
+        guard !names.isEmpty else { return self }
+        func renamed(_ name: String) -> String { names[name] ?? name }
+
+        var result = self
+        result.groups = groups.map { group in
+            RuleSchemeGroup(
+                name: renamed(group.name),
+                kind: group.kind,
+                members: group.members.map { member in
+                    switch member {
+                    case .reference(let name): return .reference(renamed(name))
+                    case .nodePattern: return member
+                    }
+                },
+                testURLString: group.testURLString,
+                interval: group.interval,
+                tolerance: group.tolerance,
+                algorithm: group.algorithm,
+                sourceType: group.sourceType,
+                sourceFormat: group.sourceFormat,
+                parameters: group.renamedParameters(using: renamed),
+                isCustomNodeFilter: group.isCustomNodeFilter
+            )
+        }
+        result.rulesets = rulesets.map {
+            var ruleset = RuleSchemeRuleset(groupName: renamed($0.groupName), resource: $0.resource,
+                                            options: $0.options, provider: $0.provider)
+            // Display-only, but the exporter groups a library rule set by it.
+            ruleset.origin = $0.origin
+            return ruleset
+        }
+        return result
+    }
+
+    private static func removingLeadingEmoji(from name: String) -> String {
+        var remainder = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var removedEmoji = false
+
+        while let character = remainder.first {
+            // Some familiar symbols, such as ♻️, are emoji only when they carry
+            // a variation selector. `isEmojiPresentation` is therefore false
+            // for their base scalar even though the whole Character is a
+            // decorative emoji. `isEmoji` covers both native emoji and those
+            // text-default symbols without splitting the grapheme cluster.
+            let isEmoji = character.unicodeScalars.contains { $0.properties.isEmoji }
+            guard isEmoji else { break }
+            remainder.removeFirst()
+            remainder = remainder.drop(while: \.isWhitespace).description
+            removedEmoji = true
+        }
+
+        return removedEmoji && !remainder.isEmpty ? remainder : name
+    }
+
+    private func isPrimaryNodeSelector(_ name: String) -> Bool {
+        let key = Self.normalizedPolicyName(name)
+        return [
+            "节点选择", "proxy", "proxy select", "select proxy", "node selection",
+        ].contains(key)
+    }
+
+    private func isGeneralRoutingTarget(_ name: String) -> Bool {
+        isCoreRoutingTarget(name) || Self.routingRegion(for: name) != nil
+    }
+
+    private func isCoreRoutingTarget(_ name: String) -> Bool {
+        let key = Self.normalizedPolicyName(name)
+        let coreNames: Set<String> = [
+            "节点选择", "手动切换", "自动选择",
+            "proxy", "proxy select", "select proxy", "node selection",
+            "manual", "manual switch", "manual select",
+            "auto", "auto select", "automatic", "automatic selection",
+        ]
+        return coreNames.contains(key) || Self.isManualRoutingTarget(name)
+    }
+
+    private static func isManualRoutingTarget(_ name: String) -> Bool {
+        ["手动切换", "手动选择", "manual", "manual switch", "manual select", "manual selection"]
+            .contains(normalizedPolicyName(name))
+    }
+
+    private static func normalizedPolicyName(_ name: String) -> String {
+        removingLeadingEmoji(from: name)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+    }
+
+    private enum SupplementalRoutingRegion: CaseIterable, Hashable {
+        case hongKong
+        case japan
+        case unitedStates
+        case singapore
+        case taiwan
+        case korea
+
+        var canonicalName: String {
+            switch self {
+            case .hongKong: "🇭🇰 香港节点"
+            case .japan: "🇯🇵 日本节点"
+            case .unitedStates: "🇺🇸 美国节点"
+            case .singapore: "🇸🇬 狮城节点"
+            case .taiwan: "🇨🇳 台湾节点"
+            case .korea: "🇰🇷 韩国节点"
+            }
+        }
+
+        var nodePattern: String {
+            switch self {
+            case .hongKong:
+                "(香港|HK|HKG|Hong Kong|HongKong)"
+            case .japan:
+                "(日本|东京|東京|大阪|埼玉|川日|泉日|沪日|深日|JP|Japan)"
+            case .unitedStates:
+                "(美国|美國|波特兰|达拉斯|俄勒冈|凤凰城|费利蒙|硅谷|拉斯维加斯|洛杉矶|洛杉磯|圣何塞|圣克拉拉|西雅图|芝加哥|United States|USA|(^|[^A-Za-z])US([^A-Za-z]|$))"
+            case .singapore:
+                "(新加坡|狮城|獅城|SG|SGP|Singapore)"
+            case .taiwan:
+                "(台湾|臺灣|台北|臺北|新北|彰化|TW|Taiwan)"
+            case .korea:
+                "(韩国|韓國|首尔|首爾|KR|KOR|Korea)"
+            }
+        }
+    }
+
+    private static func routingRegion(for name: String) -> SupplementalRoutingRegion? {
+        let normalized = normalizedPolicyName(name)
+            .replacingOccurrences(of: " nodes", with: "")
+            .replacingOccurrences(of: " node", with: "")
+        let key = normalized.hasSuffix("节点")
+            ? String(normalized.dropLast(2))
+            : normalized
+        switch key {
+        case "香港", "hong kong", "hongkong", "hk", "hkg":
+            return .hongKong
+        case "日本", "japan", "jp":
+            return .japan
+        case "美国", "美國", "united states", "usa", "us":
+            return .unitedStates
+        case "新加坡", "狮城", "獅城", "singapore", "sg", "sgp":
+            return .singapore
+        case "台湾", "臺灣", "taiwan", "tw":
+            return .taiwan
+        case "韩国", "韓國", "korea", "kr", "kor":
+            return .korea
+        default:
+            return nil
+        }
+    }
+
+    private static func injectMissingRoutingGroups(
+        into groups: [RuleSchemeGroup],
+        customization: RuleSchemeCustomization?
+    ) -> [RuleSchemeGroup] {
+        var result = groups
+        var names = Set(groups.map(\.name))
+        var index = 0
+        while index < result.count {
+            let references = result[index].members.compactMap { member -> String? in
+                guard case .reference(let name) = member else { return nil }
+                return name
+            }
+            index += 1
+            for reference in references {
+                guard !names.contains(reference) else { continue }
+                // Supplemental groups do not exist in the upstream array on
+                // which overrides were applied. Build their source definition,
+                // then apply saved edits once, just as for declared groups.
+                let sourceName = customization?.sourceGroupName(for: reference) ?? reference
+                let supplemental: RuleSchemeGroup
+                if isManualRoutingTarget(sourceName) {
+                    supplemental = RuleSchemeGroup(name: sourceName, kind: .select, members: [.nodePattern(".*")])
+                } else if let region = routingRegion(for: sourceName) {
+                    supplemental = RuleSchemeGroup(
+                        name: sourceName,
+                        kind: .urlTest,
+                        members: [.nodePattern(region.nodePattern)],
+                        testURLString: "http://www.gstatic.com/generate_204",
+                        interval: 300,
+                        tolerance: 50
+                    )
+                } else {
+                    continue
+                }
+                let edited = customization?.applying(to: [supplemental]) ?? [supplemental]
+                for group in edited where names.insert(group.name).inserted {
+                    result.append(group)
+                }
+            }
+        }
+        return result
+    }
+}
+
+/// Network fields that have stable equivalents across the supported clients.
+/// Client-specific keys remain the generator's responsibility so a Surge key
+/// is never copied verbatim into Clash, QuanX or sing-box output.
+struct RuleSchemeNetworkSettings: Codable, Hashable {
+    var ipv6Enabled: Bool?
+    var dnsServers: [String]
+    /// Domestic resolvers, used directly for Chinese and direct traffic.
+    var encryptedDNSServers: [String]
+    /// Resolvers reached only through the proxy, for everything else. Empty
+    /// in settings saved before 2026-09-29, which then fall back to
+    /// `towerDefault` rather than sending foreign names to the domestic list.
+    var remoteDNSServers: [String]
+    var proxyTestURLString: String?
+    var dnsProtectionMode: RuleSchemeDNSProtectionMode
+
+    init(
+        ipv6Enabled: Bool? = nil,
+        dnsServers: [String] = [],
+        encryptedDNSServers: [String] = [],
+        remoteDNSServers: [String] = [],
+        proxyTestURLString: String? = nil,
+        dnsProtectionMode: RuleSchemeDNSProtectionMode = .standard
+    ) {
+        self.ipv6Enabled = ipv6Enabled
+        self.dnsServers = dnsServers
+        self.encryptedDNSServers = encryptedDNSServers
+        self.remoteDNSServers = remoteDNSServers
+        self.proxyTestURLString = proxyTestURLString
+        self.dnsProtectionMode = dnsProtectionMode
+    }
+
+    var isEmpty: Bool {
+        ipv6Enabled == nil
+            && dnsServers.isEmpty
+            && encryptedDNSServers.isEmpty
+            && remoteDNSServers.isEmpty
+            && proxyTestURLString == nil
+            && dnsProtectionMode == .standard
+    }
+
+    /// Plain DNS fields are emitted into every supported client without a URL
+    /// parser in between, so only numeric IP literals are safe here. Keywords
+    /// such as `system` and hostnames can silently fall back to the carrier's
+    /// resolver or require a bootstrap lookup that Tower cannot protect.
+    static func normalizedPlainDNSServer(_ value: String) -> String? {
+        let candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return nil }
+
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, candidate, &ipv4) == 1 { return candidate }
+
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, candidate, &ipv6) == 1 { return candidate }
+        return nil
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case ipv6Enabled
+        case dnsServers
+        case encryptedDNSServers
+        case remoteDNSServers
+        case proxyTestURLString
+        case dnsProtectionMode
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ipv6Enabled = try container.decodeIfPresent(Bool.self, forKey: .ipv6Enabled)
+        dnsServers = try container.decodeIfPresent([String].self, forKey: .dnsServers) ?? []
+        encryptedDNSServers = try container.decodeIfPresent(
+            [String].self,
+            forKey: .encryptedDNSServers
+        ) ?? []
+        remoteDNSServers = try container.decodeIfPresent([String].self, forKey: .remoteDNSServers) ?? []
+        proxyTestURLString = try container.decodeIfPresent(
+            String.self,
+            forKey: .proxyTestURLString
+        )
+        let modeValue = try container.decodeIfPresent(String.self, forKey: .dnsProtectionMode)
+        dnsProtectionMode = modeValue.flatMap(RuleSchemeDNSProtectionMode.init(rawValue:))
+            ?? .standard
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(ipv6Enabled, forKey: .ipv6Enabled)
+        try container.encode(dnsServers, forKey: .dnsServers)
+        try container.encode(encryptedDNSServers, forKey: .encryptedDNSServers)
+        if !remoteDNSServers.isEmpty { try container.encode(remoteDNSServers, forKey: .remoteDNSServers) }
+        try container.encodeIfPresent(proxyTestURLString, forKey: .proxyTestURLString)
+        try container.encode(dnsProtectionMode.rawValue, forKey: .dnsProtectionMode)
+    }
+
+    static let towerDefault = RuleSchemeNetworkSettings(
+        ipv6Enabled: true,
+        dnsServers: ["223.5.5.5", "119.29.29.29"],
+        encryptedDNSServers: [
+            "https://223.5.5.5/dns-query",
+            "https://doh.pub/dns-query",
+        ],
+        // Google first: it honours EDNS Client Subnet, which lets Tower ask
+        // for a Chinese answer through the proxy. Cloudflare ignores ECS.
+        // Literal addresses, because the name dns.google is itself blocked
+        // and a domestic resolver may answer it with a forged address.
+        remoteDNSServers: [
+            "https://8.8.8.8/dns-query",
+            "https://1.1.1.1/dns-query",
+        ],
+        proxyTestURLString: "http://www.gstatic.com/generate_204"
+    )
+
+    var effectiveRemoteDNSServers: [String] {
+        remoteDNSServers.isEmpty ? Self.towerDefault.remoteDNSServers : remoteDNSServers
+    }
+
+    /// Public resolvers known to answer with the client subnet they are given.
+    static func supportsClientSubnet(_ value: String) -> Bool {
+        guard let host = URLComponents(string: value)?.host?.lowercased() else { return false }
+        return ["dns.google", "8.8.8.8", "8.8.4.4", "dns11.quad9.net", "9.9.9.11", "149.112.112.11"].contains(host)
+    }
+}
+
+enum RuleSchemeDNSProtectionMode: String, CaseIterable, Identifiable {
+    case followScheme = "follow-scheme"
+    case standard
+    case strict
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .followScheme: String(localized: "跟随方案")
+        case .standard: String(localized: "标准保护")
+        case .strict: String(localized: "严格保护")
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .followScheme:
+            String(localized: "只使用当前方案的 DNS，不额外启用 Fake-IP 或 DNS 接管。Clash 系客户端会先在本机解析每个域名。")
+        case .standard:
+            String(localized: "国内和直连域名用国内 DNS，其余域名交给代理或经代理的远程 DNS，不会发给国内 DNS。")
+        case .strict:
+            String(localized: "在支持的客户端中所有域名都经代理解析，并接管传统 DNS、启用严格路由。")
+        }
+    }
+}
+
+enum RuleSchemeLatencyTestPreset: String, CaseIterable, Identifiable {
+    case google
+    case cloudflare
+    case apple
+    case microsoft
+    case custom
+
+    var id: Self { self }
+
+    static let selectableCases: [Self] = [
+        .google,
+        .cloudflare,
+        .apple,
+        .microsoft,
+    ]
+
+    static let menuChoices: [Self] = selectableCases + [.custom]
+
+    var brandLogo: RuleSchemeLatencyTestBrandLogo {
+        switch self {
+        case .google: .google
+        case .cloudflare: .cloudflare
+        case .apple: .apple
+        case .microsoft: .microsoft
+        case .custom: .custom
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .google: String(localized: "Google 网络检查")
+        case .cloudflare: String(localized: "Cloudflare 网络检查")
+        case .apple: String(localized: "Apple 网络检查")
+        case .microsoft: String(localized: "Microsoft 网络检查")
+        case .custom: String(localized: "自定义网络检查")
+        }
+    }
+
+    var urlString: String? {
+        switch self {
+        case .google: "http://www.gstatic.com/generate_204"
+        case .cloudflare: "https://cp.cloudflare.com/generate_204"
+        case .apple: "http://captive.apple.com/hotspot-detect.html"
+        case .microsoft: "http://www.msftconnecttest.com/connecttest.txt"
+        case .custom: nil
+        }
+    }
+
+    static func selection(for urlString: String) -> Self {
+        selectableCases.first { $0.urlString == urlString } ?? .custom
+    }
+}
+
+enum RuleSchemeLatencyTestBrandLogo: String, Hashable {
+    case google
+    case cloudflare
+    case apple
+    case microsoft
+    case custom
+
+    var assetName: String {
+        switch self {
+        case .google: "LatencyGoogle"
+        case .cloudflare: "LatencyCloudflare"
+        case .apple: "LatencyApple"
+        case .microsoft: "LatencyMicrosoft"
+        case .custom: "LatencyCustom"
+        }
+    }
+}
+
+enum RuleSchemeNetworkSettingsDraftError: LocalizedError, Equatable {
+    case missingPlainDNS
+    case invalidPlainDNS(String)
+    case missingEncryptedDNS
+    case invalidEncryptedDNS(String)
+    case missingRemoteDNS
+    case invalidTestURL(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingPlainDNS:
+            String(localized: "请至少保留一个普通 DNS 服务器")
+        case .invalidPlainDNS(let value):
+            String(localized: "普通 DNS 地址无效：\(value)")
+        case .missingEncryptedDNS:
+            String(localized: "请至少保留一个国内 DNS 服务器")
+        case .invalidEncryptedDNS(let value):
+            String(localized: "加密 DNS 地址无效：\(value)")
+        case .missingRemoteDNS:
+            String(localized: "请至少保留一个远程 DNS 服务器")
+        case .invalidTestURL(let value):
+            String(localized: "测速地址无效：\(value)")
+        }
+    }
+}
+
+/// Editable, display-ready values for the native DNS form. Missing fields in
+/// imported schemes inherit Tower's safe defaults instead of appearing blank.
+struct RuleSchemeNetworkSettingsDraft: Equatable {
+    // Preserve an unspecified value when saving unrelated DNS settings.
+    // Exporters can then apply their own platform-compatible default.
+    var ipv6Override: Bool?
+    var ipv6Enabled: Bool {
+        get { ipv6Override ?? RuleSchemeNetworkSettings.towerDefault.ipv6Enabled ?? true }
+        set { ipv6Override = newValue }
+    }
+    var dnsServers: [String]
+    var encryptedDNSServers: [String]
+    var remoteDNSServers: [String]
+    var proxyTestURLString: String
+    var dnsProtectionMode: RuleSchemeDNSProtectionMode
+
+    init(settings: RuleSchemeNetworkSettings?) {
+        let defaults = RuleSchemeNetworkSettings.towerDefault
+        ipv6Override = settings?.ipv6Enabled
+        dnsServers = settings?.dnsServers.isEmpty == false
+            ? settings?.dnsServers ?? defaults.dnsServers
+            : defaults.dnsServers
+        encryptedDNSServers = settings?.encryptedDNSServers.isEmpty == false
+            ? settings?.encryptedDNSServers ?? defaults.encryptedDNSServers
+            : defaults.encryptedDNSServers
+        remoteDNSServers = settings?.effectiveRemoteDNSServers ?? defaults.remoteDNSServers
+        proxyTestURLString = settings?.proxyTestURLString ?? defaults.proxyTestURLString ?? ""
+        dnsProtectionMode = settings?.dnsProtectionMode ?? defaults.dnsProtectionMode
+    }
+
+    func validatedSettings() throws -> RuleSchemeNetworkSettings {
+        let plainDNS = normalized(dnsServers)
+        guard !plainDNS.isEmpty else {
+            throw RuleSchemeNetworkSettingsDraftError.missingPlainDNS
+        }
+        if let invalid = plainDNS.first(where: {
+            RuleSchemeNetworkSettings.normalizedPlainDNSServer($0) == nil
+        }) {
+            throw RuleSchemeNetworkSettingsDraftError.invalidPlainDNS(invalid)
+        }
+
+        let encryptedDNS = normalized(encryptedDNSServers)
+        guard !encryptedDNS.isEmpty else {
+            throw RuleSchemeNetworkSettingsDraftError.missingEncryptedDNS
+        }
+        for value in encryptedDNS {
+            guard let url = URL(string: value),
+                  ["https", "h3", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
+                  url.host != nil else {
+                throw RuleSchemeNetworkSettingsDraftError.invalidEncryptedDNS(value)
+            }
+        }
+
+        let remoteDNS = normalized(remoteDNSServers)
+        guard !remoteDNS.isEmpty else {
+            throw RuleSchemeNetworkSettingsDraftError.missingRemoteDNS
+        }
+        for value in remoteDNS {
+            guard let url = URL(string: value),
+                  ["https", "h3", "tls", "quic"].contains(url.scheme?.lowercased() ?? ""),
+                  url.host != nil else {
+                throw RuleSchemeNetworkSettingsDraftError.invalidEncryptedDNS(value)
+            }
+        }
+
+        if let latencyTestURLValidationError {
+            throw latencyTestURLValidationError
+        }
+        let testURL = proxyTestURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return RuleSchemeNetworkSettings(
+            ipv6Enabled: ipv6Override,
+            dnsServers: plainDNS,
+            encryptedDNSServers: encryptedDNS,
+            remoteDNSServers: remoteDNS,
+            proxyTestURLString: testURL,
+            dnsProtectionMode: dnsProtectionMode
+        )
+    }
+
+    mutating func applyLatencyTestPreset(_ preset: RuleSchemeLatencyTestPreset) {
+        guard let urlString = preset.urlString else { return }
+        proxyTestURLString = urlString
+    }
+
+    var latencyTestURLValidationError: RuleSchemeNetworkSettingsDraftError? {
+        let value = proxyTestURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: value),
+              ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
+              url.host != nil else {
+            return .invalidTestURL(value)
+        }
+        return nil
+    }
+
+    private func normalized(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.compactMap { rawValue in
+            let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, seen.insert(value).inserted else { return nil }
+            return value
+        }
+    }
+}
+
+enum RuleSchemeGroupEditorMode: Equatable {
+    case routingTargets
+    case nodePatternsOnly
+}
+
+/// A compact overlay for user-owned policy-group changes. Keeping it separate
+/// from the imported scheme means refreshing an upstream rule file cannot
+/// overwrite the user's order, mode, or candidate policies.
+struct RuleSchemeCustomization: Codable, Hashable {
+    let schemeID: String
+    /// User-owned filters survive source refreshes independently of overrides.
+    var addedNodeGroups: [RuleSchemeGroup]?
+    var groupOrder: [String]
+    /// Rule priority written by 1.0.6–1.0.21 whenever a group was dragged.
+    /// No longer applied or written; still decoded so `AppModel.apply` can
+    /// clear it and tell the user their routing was restored (issue #40).
+    var rulePriorityOrder: [String]?
+    /// Matching order of the rule groups after the user dragged one (issue
+    /// #45). Only groups actually moved change place (`RuleScheme.reordering`);
+    /// unlike the old `rulePriorityOrder` it is never the display order.
+    var matchingOrder: [String]?
+    var groupOverrides: [String: RuleSchemeGroupOverride]
+    /// Source policy names mapped to user-facing names. Optional keeps every
+    /// snapshot written before identity editing decodable without migration.
+    var groupRenames: [String: String]?
+    /// Optional keeps snapshots written before group deletion support fully
+    /// decodable without a custom migration.
+    var removedGroupNames: Set<String>?
+    /// A separate flag preserves three states: follow the source, use an
+    /// explicit override, or deliberately use Tower defaults (`nil`).
+    var networkSettingsOverride: RuleSchemeNetworkSettings?
+    var overridesNetworkSettings: Bool?
+
+    init(
+        schemeID: String,
+        addedNodeGroups: [RuleSchemeGroup]? = nil,
+        groupOrder: [String] = [],
+        rulePriorityOrder: [String]? = nil,
+        matchingOrder: [String]? = nil,
+        groupOverrides: [String: RuleSchemeGroupOverride] = [:],
+        groupRenames: [String: String]? = nil,
+        removedGroupNames: Set<String>? = nil,
+        networkSettingsOverride: RuleSchemeNetworkSettings? = nil,
+        overridesNetworkSettings: Bool? = nil
+    ) {
+        self.schemeID = schemeID
+        self.addedNodeGroups = addedNodeGroups
+        self.groupOrder = groupOrder
+        self.rulePriorityOrder = rulePriorityOrder
+        self.matchingOrder = matchingOrder
+        self.groupOverrides = groupOverrides
+        self.groupRenames = groupRenames
+        self.removedGroupNames = removedGroupNames
+        self.networkSettingsOverride = networkSettingsOverride
+        self.overridesNetworkSettings = overridesNetworkSettings
+    }
+
+    /// Written by hand only to sort `removedGroupNames`: `JSONEncoder` writes a
+    /// `Set` in hash order, which changes from one decode to the next, and
+    /// iCloud sync compares the encoded snapshots, so two identical states
+    /// looked like a conflict forever (issue #49). Keep every key here.
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(schemeID, forKey: .schemeID)
+        try container.encodeIfPresent(addedNodeGroups, forKey: .addedNodeGroups)
+        try container.encode(groupOrder, forKey: .groupOrder)
+        try container.encodeIfPresent(rulePriorityOrder, forKey: .rulePriorityOrder)
+        try container.encodeIfPresent(matchingOrder, forKey: .matchingOrder)
+        try container.encode(groupOverrides, forKey: .groupOverrides)
+        try container.encodeIfPresent(groupRenames, forKey: .groupRenames)
+        try container.encodeIfPresent(removedGroupNames?.sorted(), forKey: .removedGroupNames)
+        try container.encodeIfPresent(networkSettingsOverride, forKey: .networkSettingsOverride)
+        try container.encodeIfPresent(overridesNetworkSettings, forKey: .overridesNetworkSettings)
+    }
+
+    func renamedGroupName(_ name: String) -> String {
+        groupRenames?[name] ?? name
+    }
+
+    func sourceGroupName(for visibleName: String) -> String {
+        groupRenames?.first(where: { $0.value == visibleName })?.key ?? visibleName
+    }
+
+    func applying(to groups: [RuleSchemeGroup]) -> [RuleSchemeGroup] {
+        let removedNames = removedGroupNames ?? []
+        let customizedGroups = groups.compactMap { group -> RuleSchemeGroup? in
+            let visibleName = renamedGroupName(group.name)
+            guard !removedNames.contains(visibleName) else { return nil }
+            let override = groupOverrides[visibleName] ?? groupOverrides[group.name]
+            var members = override?.members ?? group.members
+            members = members.map { member in
+                guard case .reference(let name) = member else { return member }
+                return .reference(renamedGroupName(name))
+            }
+            members.removeAll { member in
+                guard case .reference(let name) = member else { return false }
+                return removedNames.contains(name)
+            }
+            let kind = override?.kind ?? group.kind
+            var parameters = group.renamedParameters(using: renamedGroupName)
+            if let patterns = override?.sourceNodePatterns,
+               let data = try? JSONEncoder().encode(patterns),
+               let encoded = String(data: data, encoding: .utf8) {
+                parameters = parameters ?? [:]
+                parameters?["tower-source-patterns"] = encoded
+            }
+            return RuleSchemeGroup(
+                name: visibleName,
+                kind: kind,
+                members: members,
+                testURLString: group.testURLString,
+                interval: group.interval,
+                tolerance: group.tolerance,
+                algorithm: kind == group.kind && override?.resetsSourceOptions != true ? group.algorithm : nil,
+                sourceType: kind == group.kind && override?.resetsSourceOptions != true ? group.sourceType : nil,
+                sourceFormat: kind == group.kind && override?.resetsSourceOptions != true ? group.sourceFormat : nil,
+                parameters: kind == group.kind && override?.resetsSourceOptions != true ? parameters : nil,
+                isCustomNodeFilter: group.isCustomNodeFilter
+            )
+        }
+
+        guard !groupOrder.isEmpty else { return customizedGroups }
+        let byName = Dictionary(customizedGroups.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        var seen = Set<String>()
+        let ordered = groupOrder.compactMap { name -> RuleSchemeGroup? in
+            guard seen.insert(name).inserted else { return nil }
+            return byName[name]
+        }
+        return ordered + customizedGroups.filter { seen.insert($0.name).inserted }
+    }
+
+    func applying(to expansion: CustomRuleFlowExpansion) -> CustomRuleFlowExpansion {
+        let policyGroup = expansion.policyGroup.flatMap { applying(to: [$0]).first }
+        return CustomRuleFlowExpansion(
+            ruleSet: expansion.ruleSet,
+            policyGroup: policyGroup,
+            binding: RuleSetPolicyBinding(
+                ruleSetID: expansion.binding.ruleSetID,
+                policyGroupName: renamedGroupName(expansion.binding.policyGroupName)
+            )
+        )
+    }
+}
+
+struct RuleSchemeGroupOverride: Codable, Hashable {
+    var kind: RuleSchemeGroup.Kind?
+    var members: [RuleSchemeGroupMember]?
+    var resetsSourceOptions: Bool?
+    var sourceNodePatterns: [String]?
+
+    init(
+        kind: RuleSchemeGroup.Kind? = nil,
+        members: [RuleSchemeGroupMember]? = nil,
+        resetsSourceOptions: Bool? = nil,
+        sourceNodePatterns: [String]? = nil
+    ) {
+        self.kind = kind
+        self.members = members
+        self.resetsSourceOptions = resetsSourceOptions
+        self.sourceNodePatterns = sourceNodePatterns
+    }
+}
+
+struct RuleSchemeGroup: Codable, Hashable {
+    /// App metadata, never emitted as a client configuration option.
+    let isCustomNodeFilter: Bool?
+    enum Kind: String, Codable {
+        case select
+        case urlTest
+        case smart
+        case fallback
+        case loadBalance
+        case conditional
+        case relay
+        case unsupported
+
+        var displayTitle: String {
+            switch self {
+            case .select: String(localized: "手动选择")
+            case .urlTest: String(localized: "延迟优选")
+            case .smart: "Smart"
+            case .fallback: String(localized: "故障转移")
+            case .loadBalance: String(localized: "负载均衡")
+            case .conditional: String(localized: "按网络选择")
+            case .relay: String(localized: "链式代理")
+            case .unsupported: String(localized: "未知策略")
+            }
+        }
+
+        var configurationType: String {
+            switch self {
+            case .select: "select"
+            case .urlTest: "url-test"
+            case .smart: "smart"
+            case .fallback: "fallback"
+            case .loadBalance: "load-balance"
+            case .conditional: "conditional"
+            case .relay: "relay"
+            case .unsupported: "unsupported"
+            }
+        }
+    }
+
+    let name: String
+    let kind: Kind
+    /// Members in their declared order; the order decides how the client lists
+    /// them, so it must survive parsing.
+    let members: [RuleSchemeGroupMember]
+    let testURLString: String?
+    let interval: Int?
+    let tolerance: Int?
+    let algorithm: String?
+    let sourceType: String?
+    let sourceFormat: String?
+    let parameters: [String: String]?
+
+    init(
+        name: String,
+        kind: Kind,
+        members: [RuleSchemeGroupMember],
+        testURLString: String? = nil,
+        interval: Int? = nil,
+        tolerance: Int? = nil,
+        algorithm: String? = nil,
+        sourceType: String? = nil,
+        sourceFormat: String? = nil,
+        parameters: [String: String]? = nil,
+        isCustomNodeFilter: Bool? = nil
+    ) {
+        self.name = name
+        self.kind = kind
+        self.members = members
+        self.testURLString = testURLString
+        self.interval = interval
+        self.tolerance = tolerance
+        self.algorithm = algorithm
+        self.sourceType = sourceType
+        self.sourceFormat = sourceFormat
+        self.parameters = parameters
+        self.isCustomNodeFilter = isCustomNodeFilter
+    }
+
+    /// Only policy-valued fields are rewritten; SSIDs and regex keys remain literal.
+    func renamedParameters(using rename: (String) -> String) -> [String: String]? {
+        guard var values = parameters else { return nil }
+        func encoded(_ object: Any) -> String? {
+            guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            return text
+        }
+        for key in ["ssid-members", "subnet-fields"] {
+            guard let raw = values[key], let data = raw.data(using: .utf8),
+                  let fields = try? JSONSerialization.jsonObject(with: data) as? [String] else { continue }
+            let renamed = fields.enumerated().map { index, field -> String in
+                if key == "ssid-members", index < 2 { return rename(field) }
+                let separator: Character = key == "ssid-members" ? ":" : "="
+                guard let split = field.firstIndex(of: separator) else { return field }
+                let name = String(field[field.index(after: split)...]).trimmingCharacters(in: .whitespaces)
+                return String(field[...split]) + rename(name)
+            }
+            values[key] = encoded(renamed)
+        }
+        if let name = values["default_policy"] { values["default_policy"] = rename(name) }
+        if let raw = values["rules"], let data = raw.data(using: .utf8),
+           let rules = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            func rewritePolicies(_ value: Any) -> Any {
+                if let dictionary = value as? [String: Any] {
+                    return dictionary.reduce(into: [String: Any]()) { result, pair in
+                        if pair.key == "policy", let name = pair.value as? String {
+                            result[pair.key] = rename(name)
+                        } else {
+                            result[pair.key] = rewritePolicies(pair.value)
+                        }
+                    }
+                }
+                if let array = value as? [Any] { return array.map(rewritePolicies) }
+                return value
+            }
+            values["rules"] = encoded(rewritePolicies(rules))
+        }
+        return values
+    }
+}
+
+enum RuleSchemeGroupMember: Codable, Hashable {
+    /// A `[]`-prefixed member: another group, or a builtin such as DIRECT.
+    case reference(String)
+    /// A bare member: a regular expression matched against node names. `.*`
+    /// selects every node.
+    case nodePattern(String)
+}
+
+struct RuleSchemeRuleset: Codable, Hashable {
+    enum Resource: Codable, Hashable {
+        case remote(URL)
+        /// A `[]`-prefixed rule written directly in the config, such as
+        /// `[]GEOIP,CN` or `[]FINAL`.
+        case inline(String)
+
+        /// Recognize the representation persisted by older builds as well.
+        var domainSetURL: URL? {
+            guard case .inline(let line) = self else { return nil }
+            let fields = line.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard fields.count >= 2, fields[0].uppercased() == "DOMAIN-SET" else { return nil }
+            return URL(string: fields[1])
+        }
+
+        var downloadURL: URL? {
+            if case .remote(let url) = self { return url }
+            return domainSetURL
+        }
+    }
+
+    let groupName: String
+    let resource: Resource
+
+    /// Where a materialized ruleset came from, for display only. Never
+    /// persisted and ignored by equality, so generation and caches are
+    /// unaffected.
+    enum Origin: Hashable {
+        /// A condition the user attached to an existing group.
+        case supplement
+        /// A catalog item or a ruleset from the user's library.
+        case added(String)
+    }
+
+    /// mihomo's binary rule set format (`format: mrs`). Tower has no decoder
+    /// for it: it is never downloaded or read as text.
+    var isBinaryRuleSet: Bool {
+        provider?.format?.lowercased() == "mrs" || resource.downloadURL?.pathExtension.lowercased() == "mrs"
+    }
+
+    /// Options on a FINAL or remote reference survive persistence and group edits.
+    var options: [String]? = nil
+    var provider: RuleProviderMetadata? = nil
+    var origin: Origin? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case groupName, resource, options, provider
+    }
+
+    static func == (lhs: RuleSchemeRuleset, rhs: RuleSchemeRuleset) -> Bool {
+        lhs.groupName == rhs.groupName && lhs.resource == rhs.resource
+            && lhs.options == rhs.options && lhs.provider == rhs.provider
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(groupName)
+        hasher.combine(resource)
+        hasher.combine(options)
+        hasher.combine(provider)
+    }
+}
+
+struct RuleProviderMetadata: Codable, Hashable {
+    var behavior: String?
+    var format: String?
+    var interval: Int?
+}

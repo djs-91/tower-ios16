@@ -1,0 +1,2671 @@
+import Foundation
+import Network
+
+enum SubscriptionError: LocalizedError {
+    case invalidURL
+    case invalidDNSURL
+    case badResponse
+    case httpStatus(Int)
+    case emptySubscription
+    case noSupportedNodes
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidURL: String(localized: "订阅地址无效")
+        case .invalidDNSURL: String(localized: "自定义 DNS 必须是 HTTPS 的 DNS-over-HTTPS 地址")
+        case .badResponse: String(localized: "订阅服务器返回了无法识别的响应")
+        case .httpStatus(let status): String(localized: "订阅服务器返回 HTTP \(status)")
+        case .emptySubscription: String(localized: "订阅内容为空")
+        case .noSupportedNodes: String(localized: "没有找到可识别的节点")
+        }
+    }
+}
+
+protocol SubscriptionFetching {
+    func fetch(_ source: SubscriptionSource) async throws -> ImportResult
+}
+
+struct SubscriptionService: SubscriptionFetching {
+    var parser: SubscriptionParser
+    private let requestBuilder: SubscriptionRequestBuilder
+    private let httpClient: any SubscriptionHTTPDataLoading
+
+    init(
+        parser: SubscriptionParser = SubscriptionParser(),
+        requestBuilder: SubscriptionRequestBuilder = SubscriptionRequestBuilder(),
+        httpClient: any SubscriptionHTTPDataLoading = SubscriptionHTTPClient()
+    ) {
+        self.parser = parser
+        self.requestBuilder = requestBuilder
+        self.httpClient = httpClient
+    }
+
+    func fetch(_ source: SubscriptionSource) async throws -> ImportResult {
+        guard let url = URL(string: source.urlString), url.host != nil else {
+            throw SubscriptionError.invalidURL
+        }
+        guard let scheme = url.scheme?.lowercased(),
+              ["http", "https"].contains(scheme) else {
+            throw SubscriptionError.invalidURL
+        }
+
+        var result = try await load(url, source: source)
+
+        // The node list is authoritative for nodes; only the quota may be
+        // missing from it. Airports that answer `flag=clash` send a
+        // `subscription-userinfo` header, so a second request fills the gap —
+        // but its body is not used, because the panel's Clash converter drops
+        // whatever it cannot express. One real airport returns 43 of its 55
+        // nodes that way, silently losing every AnyTLS entry.
+        //
+        // This used to be an `async let` started before the main request, so
+        // every refresh put two requests on one airport panel simultaneously.
+        // That is precisely the burst the per-host refresh queue in AppModel
+        // exists to prevent, and precisely what a panel rate-limits. It now
+        // runs only when the list really carried no quota, and only after.
+        guard result.usage?.hasPlanDetail != true,
+              let probe = Self.quotaProbe(for: url),
+              let usage = try? await quota(at: probe, source: source) else { return result }
+
+        var merged = usage
+        merged.notices = result.usage?.notices ?? []
+        result.usage = merged
+        return result
+    }
+
+    /// The same subscription asked for in Clash's dialect, purely to read the
+    /// quota header. `nil` when the caller already pinned a flag themselves.
+    private static func quotaProbe(for url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        let existing = components.queryItems ?? []
+        guard !existing.contains(where: { $0.name.lowercased() == "flag" }) else { return nil }
+        components.queryItems = existing + [URLQueryItem(name: "flag", value: "clash")]
+        return components.url
+    }
+
+    private func quota(at url: URL, source: SubscriptionSource) async throws -> SubscriptionUsage {
+        let request = try requestBuilder.make(url: url, source: source, timeout: 15)
+        let dnsURL = try source.requestOptions?.validatedDNSOverHTTPSURL()
+        let (_, response) = try await httpClient.data(for: request, dnsOverHTTPSURL: dnsURL)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode),
+              let header = httpResponse.value(forHTTPHeaderField: "subscription-userinfo"),
+              let usage = SubscriptionUsage.parse(header: header) else {
+            throw SubscriptionError.badResponse
+        }
+        return usage
+    }
+
+    private func load(_ url: URL, source: SubscriptionSource) async throws -> ImportResult {
+        let dnsURL = try source.requestOptions?.validatedDNSOverHTTPSURL()
+        let customUserAgent = source.requestOptions?.userAgent?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let allowsCompatibilityFallback = customUserAgent?.isEmpty != false
+        let fallbackUserAgents = allowsCompatibilityFallback
+            ? SubscriptionRequestBuilder.compatibilityUserAgents
+            : []
+        let userAgentAttempts: [String?] = [nil] + fallbackUserAgents.map(Optional.some)
+
+        for (index, fallbackUserAgent) in userAgentAttempts.enumerated() {
+            let request = try requestBuilder.make(
+                url: url,
+                source: source,
+                timeout: 30,
+                overridingUserAgent: fallbackUserAgent
+            )
+            let (data, response) = try await httpClient.data(
+                for: request,
+                dnsOverHTTPSURL: dnsURL
+            )
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw SubscriptionError.badResponse
+            }
+            let hasAnotherAttempt = index < userAgentAttempts.count - 1
+            guard (200..<300).contains(httpResponse.statusCode) else {
+                if hasAnotherAttempt, Self.isClientGatingResponse(response) {
+                    continue
+                }
+                throw SubscriptionError.httpStatus(httpResponse.statusCode)
+            }
+            guard !data.isEmpty else {
+                if hasAnotherAttempt { continue }
+                throw SubscriptionError.emptySubscription
+            }
+
+            let parsed = parser.parse(data: data, sourceID: source.id)
+            guard !parsed.nodes.isEmpty else {
+                if hasAnotherAttempt { continue }
+                throw SubscriptionError.noSupportedNodes
+            }
+
+            // Only this one header is read. Keeping the whole response would drag
+            // cookies and other session state into app state for no reason.
+            let header = httpResponse.value(forHTTPHeaderField: "subscription-userinfo")
+                .flatMap(SubscriptionUsage.parse(header:))
+            var usage = header ?? parsed.status ?? SubscriptionUsage()
+            usage.notices = parsed.notices
+
+            return ImportResult(
+                nodes: parsed.nodes,
+                rejectedLineCount: parsed.rejectedLineCount,
+                usage: usage.isEmpty ? nil : usage,
+                suggestedName: Self.providerTitle(from: httpResponse)
+            )
+        }
+
+        throw SubscriptionError.noSupportedNodes
+    }
+
+    private static func isClientGatingResponse(_ response: URLResponse) -> Bool {
+        guard let httpResponse = response as? HTTPURLResponse else { return false }
+        return SubscriptionRequestBuilder.clientGatingStatusCodes.contains(httpResponse.statusCode)
+    }
+
+    /// Reads the same profile naming hints used by modern subscription apps.
+    /// Hiddify documents `Profile-Title` as the first-priority value and allows
+    /// a base64 UTF-8 form for names containing emoji.
+    static func providerTitle(from response: HTTPURLResponse) -> String? {
+        for header in ["Profile-Title", "Subscription-Title"] {
+            if let value = response.value(forHTTPHeaderField: header),
+               let decoded = decodedProfileTitle(value) {
+                return decoded
+            }
+        }
+
+        guard let disposition = response.value(forHTTPHeaderField: "Content-Disposition") else {
+            return nil
+        }
+        let pattern = #"filename\*?=(?:UTF-8''|\")?([^\";]+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+              let match = regex.firstMatch(
+                in: disposition,
+                range: NSRange(disposition.startIndex..., in: disposition)
+              ),
+              let range = Range(match.range(at: 1), in: disposition) else { return nil }
+        let fileName = String(disposition[range]).removingPercentEncoding ?? String(disposition[range])
+        let stem = (fileName as NSString).deletingPathExtension
+        return decodedProfileTitle(stem)
+    }
+
+    private static func decodedProfileTitle(_ rawValue: String) -> String? {
+        let trimmed = rawValue.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n\"'"))
+        let decoded: String
+        if trimmed.lowercased().hasPrefix("base64:"),
+           let data = Data(base64Encoded: String(trimmed.dropFirst("base64:".count))),
+           let value = String(data: data, encoding: .utf8) {
+            decoded = value
+        } else {
+            decoded = trimmed.removingPercentEncoding ?? trimmed
+        }
+        let result = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+        return result.isEmpty ? nil : result
+    }
+}
+
+struct SubscriptionRequestBuilder {
+    static let shadowrocketCompatibilityUserAgent =
+        "Shadowrocket/3378 CFNetwork/3892.100.1 Darwin/27.0.0"
+    static let defaultUserAgent = shadowrocketCompatibilityUserAgent
+    static let clientGatingStatusCodes: Set<Int> = [403, 406, 421, 426]
+    static let clashMetaCompatibilityUserAgent = "clash.meta"
+    static let compatibilityUserAgents = [clashMetaCompatibilityUserAgent]
+
+    func make(
+        url: URL,
+        source: SubscriptionSource,
+        timeout: TimeInterval,
+        overridingUserAgent: String? = nil
+    ) throws -> URLRequest {
+        _ = try source.requestOptions?.validatedDNSOverHTTPSURL()
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        let custom = source.requestOptions?.userAgent?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        request.setValue(
+            overridingUserAgent ?? (custom?.isEmpty == false ? custom : Self.defaultUserAgent),
+            forHTTPHeaderField: "User-Agent"
+        )
+        return request
+    }
+}
+
+/// Allows ordinary subscription requests to run together while reserving
+/// exclusive access for a request that temporarily changes Network.framework's
+/// process-wide encrypted resolver.
+actor SubscriptionRequestGate {
+    private struct Waiter {
+        let needsExclusiveAccess: Bool
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var activeReaders = 0
+    private var hasActiveWriter = false
+    private var waiters: [Waiter] = []
+
+    func acquire(needsExclusiveAccess: Bool) async {
+        if needsExclusiveAccess {
+            if !hasActiveWriter, activeReaders == 0 {
+                hasActiveWriter = true
+                return
+            }
+        } else if !hasActiveWriter,
+                  !waiters.contains(where: \.needsExclusiveAccess) {
+            activeReaders += 1
+            return
+        }
+        await withCheckedContinuation {
+            waiters.append(Waiter(needsExclusiveAccess: needsExclusiveAccess, continuation: $0))
+        }
+    }
+
+    func release(wasExclusiveAccess: Bool) {
+        if wasExclusiveAccess {
+            hasActiveWriter = false
+        } else {
+            activeReaders -= 1
+        }
+        resumeEligibleWaiters()
+    }
+
+    private func resumeEligibleWaiters() {
+        guard !hasActiveWriter, activeReaders == 0, !waiters.isEmpty else { return }
+        if waiters[0].needsExclusiveAccess {
+            hasActiveWriter = true
+            waiters.removeFirst().continuation.resume()
+            return
+        }
+
+        while !waiters.isEmpty, !waiters[0].needsExclusiveAccess {
+            activeReaders += 1
+            waiters.removeFirst().continuation.resume()
+        }
+    }
+}
+
+protocol SubscriptionHTTPDataLoading {
+    func data(
+        for request: URLRequest,
+        dnsOverHTTPSURL: URL?
+    ) async throws -> (Data, URLResponse)
+}
+
+protocol SubscriptionURLSessionLoading {
+    func data(for request: URLRequest) async throws -> (Data, URLResponse)
+    func finishTasksAndInvalidate()
+}
+
+extension URLSession: SubscriptionURLSessionLoading {}
+
+struct SubscriptionHTTPClient: SubscriptionHTTPDataLoading {
+    private static let gate = SubscriptionRequestGate()
+    private let sharedSession: any SubscriptionURLSessionLoading
+    private let isolatedSessionFactory: () -> any SubscriptionURLSessionLoading
+    private let dnsApplier: (URL) -> Void
+    private let dnsResetter: () -> Void
+
+    /// One ephemeral session shared by every subscription request.
+    ///
+    /// Building a session per request threw the connection away with it, so a
+    /// refresh of ten subscriptions paid for ten full TLS handshakes — more
+    /// once the compatibility retries ran. Ephemeral keeps the property that
+    /// actually mattered: nothing about these requests is written to disk.
+    /// Cookie handling is switched off outright rather than merely kept in
+    /// memory, so a provider cannot use one to correlate refreshes.
+    private static let session: URLSession = makeSession()
+
+    private static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        return URLSession(configuration: configuration)
+    }
+
+    init() {
+        self.sharedSession = Self.session
+        self.isolatedSessionFactory = { Self.makeSession() }
+        self.dnsApplier = Self.applyDNSOverHTTPS
+        self.dnsResetter = Self.resetDNS
+    }
+
+    init(
+        sharedSession: any SubscriptionURLSessionLoading,
+        isolatedSessionFactory: @escaping () -> any SubscriptionURLSessionLoading,
+        applyDNSOverHTTPS: @escaping (URL) -> Void,
+        resetDNS: @escaping () -> Void
+    ) {
+        self.sharedSession = sharedSession
+        self.isolatedSessionFactory = isolatedSessionFactory
+        self.dnsApplier = applyDNSOverHTTPS
+        self.dnsResetter = resetDNS
+    }
+
+    func data(
+        for request: URLRequest,
+        dnsOverHTTPSURL: URL?
+    ) async throws -> (Data, URLResponse) {
+        let needsExclusiveAccess = dnsOverHTTPSURL != nil
+        await Self.gate.acquire(needsExclusiveAccess: needsExclusiveAccess)
+        let session: any SubscriptionURLSessionLoading
+        if let dnsOverHTTPSURL {
+            dnsApplier(dnsOverHTTPSURL)
+            // URLSession pools persistent connections. A shared session may
+            // therefore reuse a socket opened before the custom resolver was
+            // installed and skip DNS entirely. A request-scoped session starts
+            // with an empty pool, then is invalidated before the resolver is
+            // restored so no connection can escape this DNS window.
+            session = isolatedSessionFactory()
+        } else {
+            session = sharedSession
+        }
+
+        do {
+            let result = try await session.data(for: request)
+            if dnsOverHTTPSURL != nil {
+                session.finishTasksAndInvalidate()
+                dnsResetter()
+            }
+            await Self.gate.release(wasExclusiveAccess: needsExclusiveAccess)
+            return result
+        } catch {
+            if dnsOverHTTPSURL != nil {
+                session.finishTasksAndInvalidate()
+                dnsResetter()
+            }
+            await Self.gate.release(wasExclusiveAccess: needsExclusiveAccess)
+            throw error
+        }
+    }
+
+    /// Switches the process-wide resolver to the user's encrypted one.
+    ///
+    /// This is deliberately not scoped to the request, because it cannot be:
+    /// an encrypted resolver is configured on an `NWParameters.PrivacyContext`,
+    /// and URLSession offers no way to attach one. Only a hand-written
+    /// NWConnection client could — which would mean reimplementing TLS
+    /// handling, redirects and chunked transfer to gain it.
+    ///
+    /// `SubscriptionRequestGate` therefore serialises subscription requests
+    /// around the window, but it cannot cover the rest of the app: a rule
+    /// download, a latency probe or a country lookup running at the same moment
+    /// also resolves through this resolver. The window is a single request long
+    /// and the setting is restored in both the success and failure paths, so
+    /// the exposure is bounded rather than eliminated.
+    private static func applyDNSOverHTTPS(_ url: URL) {
+        let context = NWParameters.PrivacyContext.default
+        context.requireEncryptedNameResolution(
+            true,
+            fallbackResolver: .https(url, serverAddresses: [])
+        )
+        context.flushCache()
+    }
+
+    private static func resetDNS() {
+        let context = NWParameters.PrivacyContext.default
+        context.requireEncryptedNameResolution(
+            false,
+            fallbackResolver: nil
+        )
+        context.flushCache()
+    }
+}
+
+struct SubscriptionParser {
+    struct ParsedContent {
+        let nodes: [ProxyNode]
+        let rejectedLineCount: Int
+        /// Airport announcements smuggled into the node list — remaining
+        /// traffic, expiry and the like.
+        var notices: [String] = []
+        /// Quota read from a `STATUS=` line at the head of the list, for the
+        /// panels that put it there instead of in the response header.
+        var status: SubscriptionUsage?
+    }
+
+    /// Names that are an announcement rather than a node.
+    ///
+    /// Several airports publish quota and expiry as extra entries whose only
+    /// real content is the name. Importing them yields nodes that cannot
+    /// connect and inflates the node count, so they become subscription
+    /// metadata instead. The list is deliberately narrow: a real node is not
+    /// called 剩余流量 or 套餐到期, but it may well be called 香港 IEPL 专线.
+    private static let noticeKeywords = [
+        "剩余流量", "已用流量", "总流量", "流量重置", "距离下次重置", "重置剩余",
+        "套餐到期", "到期时间", "过期时间", "有效期至", "账户余额",
+        "官网", "续费", "客服", "邮箱", "订阅地址", "机场地址",
+        "expire", "expires", "traffic", "remaining", "reset"
+    ]
+
+    /// Hosts an airport parks its announcement entries on so they look like
+    /// nodes. No real proxy runs on a public resolver.
+    private static let placeholderHosts: Set<String> = [
+        "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1", "223.5.5.5",
+        "127.0.0.1", "0.0.0.0", "localhost", "example.com"
+    ]
+
+    static func isNotice(_ name: String) -> Bool {
+        let text = name.lowercased()
+        return noticeKeywords.contains { text.contains($0.lowercased()) }
+    }
+
+    /// Announcements the keyword list misses still give themselves away by
+    /// where they point: one airport advertises its client this way, with the
+    /// pitch as the name and `8.8.8.8:8` as the endpoint.
+    static func isNotice(_ node: ProxyNode) -> Bool {
+        isNotice(node.name) || placeholderHosts.contains(node.server.lowercased())
+    }
+
+    func parse(data: Data, sourceID: UUID? = nil) -> ParsedContent {
+        guard var text = String(data: data, encoding: .utf8) else {
+            return .init(nodes: [], rejectedLineCount: 1)
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !containsNodeScheme(text),
+           let decoded = decodeBase64String(text),
+           containsNodeScheme(decoded) {
+            text = decoded
+        }
+
+        if let parsed = parseMASQUEJSON(text, sourceID: sourceID) { return parsed }
+
+        if text.hasPrefix("{") || text.hasPrefix("[") && !containsSurgeProxySection(text) {
+            if let records = shadowrocketJSONRecords(text) {
+                let nodes = records.compactMap { shadowrocketJSONNode($0, sourceID: sourceID) }
+                let marked = restoringAmbiguousRegionalNames(nodes).map(markingSubscriptionMetadata)
+                return .init(nodes: deduplicated(marked), rejectedLineCount: records.count - nodes.count)
+            }
+        }
+
+        if containsSurgeProxySection(text) {
+            let parsed = parseSurgeProxyConfiguration(text, sourceID: sourceID)
+            let marked = restoringAmbiguousRegionalNames(parsed.nodes)
+                .map(markingSubscriptionMetadata)
+            let notices = marked.filter { $0.isSubscriptionMetadata == true }.map(\.name)
+            return .init(
+                nodes: deduplicated(marked),
+                rejectedLineCount: parsed.rejectedLineCount,
+                notices: notices,
+                status: notices.lazy.compactMap(SubscriptionUsage.parse(statusLine:)).first
+            )
+        }
+
+        if text.contains("proxies:") {
+            let parsed = parseClashYAML(text, sourceID: sourceID)
+            let marked = restoringAmbiguousRegionalNames(parsed.nodes)
+                .map(markingSubscriptionMetadata)
+            let notices = marked.filter { $0.isSubscriptionMetadata == true }.map(\.name)
+            return .init(
+                nodes: deduplicated(marked),
+                rejectedLineCount: parsed.rejectedLineCount,
+                notices: notices,
+                status: notices.lazy.compactMap(SubscriptionUsage.parse(statusLine:)).first
+            )
+        }
+
+        let candidates = text
+            .components(separatedBy: .newlines)
+            .flatMap { line -> [String] in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.contains(" ") && trimmed.filter({ $0 == ":" }).count > 1 {
+                    return trimmed.components(separatedBy: .whitespaces).filter(containsNodeScheme)
+                }
+                return [trimmed]
+            }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+
+        var nodes: [ProxyNode] = []
+        var rejected = 0
+        var status: SubscriptionUsage?
+        for candidate in candidates {
+            // Not a node and not a failure: some panels lead with the quota.
+            if candidate.hasPrefix(SubscriptionUsage.statusPrefix) {
+                status = status ?? SubscriptionUsage.parse(statusLine: candidate)
+                continue
+            }
+            if let node = parseURI(candidate, sourceID: sourceID) {
+                nodes.append(node)
+            } else {
+                rejected += 1
+            }
+        }
+        let marked = restoringAmbiguousRegionalNames(nodes)
+            .map(markingSubscriptionMetadata)
+        let notices = marked.filter { $0.isSubscriptionMetadata == true }.map(\.name)
+        return .init(
+            nodes: deduplicated(marked),
+            rejectedLineCount: rejected,
+            notices: notices,
+            // Other panels write the same line in as a node remark.
+            status: status ?? notices.lazy.compactMap(SubscriptionUsage.parse(statusLine:)).first
+        )
+    }
+
+    /// Shadowrocket copies either a JSON array or adjacent JSON objects.
+    /// Track JSON string escapes so braces in names and header values never
+    /// split a record. Unknown/malformed documents are not treated as nodes.
+    private func shadowrocketJSONRecords(_ text: String) -> [Any]? {
+        if let value = try? JSONSerialization.jsonObject(with: Data(text.utf8)) {
+            if let array = value as? [Any] { return array }
+            if value is [String: Any] { return [value] }
+            return nil
+        }
+        var records: [Any] = []
+        var depth = 0
+        var quoted = false
+        var escaped = false
+        var buffer = ""
+        for character in text {
+            if depth == 0 {
+                if character.isWhitespace { continue }
+                guard character == "{" else { return nil }
+            }
+            buffer.append(character)
+            if quoted {
+                if escaped { escaped = false }
+                else if character == "\\" { escaped = true }
+                else if character == "\"" { quoted = false }
+                continue
+            }
+            if character == "\"" { quoted = true }
+            else if character == "{" { depth += 1 }
+            else if character == "}" {
+                depth -= 1
+                if depth == 0 {
+                    guard let value = try? JSONSerialization.jsonObject(with: Data(buffer.utf8)) else { return nil }
+                    records.append(value)
+                    buffer = ""
+                }
+            }
+        }
+        return depth == 0 && !records.isEmpty ? records : nil
+    }
+
+    private func shadowrocketJSONNode(_ value: Any, sourceID: UUID?) -> ProxyNode? {
+        guard let json = value as? [String: Any],
+              stringValue(json["type"])?.lowercased() == "vmess",
+              let server = stringValue(json["host"]), !server.isEmpty,
+              let port = intValue(json["port"]), (1...65535).contains(port),
+              let credential = stringValue(json["password"]), !credential.isEmpty else { return nil }
+        // These settings cannot be represented by the current node model.
+        // Never silently turn a pinned/chained/custom-TLS node into a plain one.
+        for key in ["cert", "hpkp", "chain", "plugin", "ech", "tlsProfile", "privateKey", "publicKey"] {
+            if let field = stringValue(json[key]), !field.isEmpty { return nil }
+        }
+        let transport = normalizedVMessTransport(stringValue(json["obfs"])) ?? "tcp"
+        let rawHost = stringValue(json["obfsParam"])
+        let host = transport == "ws" ? webSocketHost(from: rawHost) : rawHost
+        if transport == "ws", let rawHost, !rawHost.isEmpty, host == nil { return nil }
+        return ProxyNode(
+            sourceID: sourceID, kind: .vmess,
+            name: normalizedName(stringValue(json["title"]), fallback: server),
+            server: normalizedHost(server), port: port,
+            cipher: stringValue(json["method"]) ?? "auto", uuid: credential,
+            transport: transport, tls: boolValue(json["tls"]),
+            sni: stringValue(json["peer"]), hostHeader: host,
+            path: stringValue(json["path"])?.replacingOccurrences(of: "\\/", with: "/"), alpn: stringValue(json["alpn"]),
+            alterID: intValue(json["alterId"]), udpRelayEnabled: boolValue(json["udp"]), rawURI: ""
+        )
+    }
+
+    private func containsSurgeProxySection(_ text: String) -> Bool {
+        text.components(separatedBy: .newlines).contains { line in
+            line.trimmingCharacters(in: .whitespacesAndNewlines)
+                .caseInsensitiveCompare("[Proxy]") == .orderedSame
+        }
+    }
+
+    /// Reads the proxy list from a complete Surge/Shadowrocket INI profile.
+    /// Other sections can contain ordinary HTTPS URLs (DNS and rewrites),
+    /// which must never be mistaken for standalone HTTP proxy links.
+    private func parseSurgeProxyConfiguration(
+        _ text: String,
+        sourceID: UUID?
+    ) -> ParsedContent {
+        var insideProxySection = false
+        var nodes: [ProxyNode] = []
+        var rejected = 0
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty,
+                  !line.hasPrefix("#"),
+                  !line.hasPrefix(";"),
+                  !line.hasPrefix("//") else { continue }
+
+            if line.hasPrefix("["), line.hasSuffix("]"), !line.contains("=") {
+                insideProxySection = line.caseInsensitiveCompare("[Proxy]") == .orderedSame
+                continue
+            }
+            guard insideProxySection else { continue }
+
+            if let node = parseMASQUELine(line, sourceID: sourceID) ?? parseSurgeShadowsocksLine(line, sourceID: sourceID) {
+                nodes.append(node)
+            } else {
+                rejected += 1
+            }
+        }
+
+        return .init(
+            nodes: nodes,
+            rejectedLineCount: nodes.isEmpty ? max(rejected, 1) : rejected
+        )
+    }
+
+    /// Only the documented HTTP Basic variant. Unknown semantic parameters
+    /// must not be dropped (in particular CONNECT-IP keys and proxy chains).
+    private func parseMASQUELine(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        guard let separator = raw.firstIndex(of: "="), !raw.contains(where: \.isNewline) else { return nil }
+        let name = String(raw[..<separator]).trimmingCharacters(in: .whitespaces)
+        let fields = surgeProxyFields(String(raw[raw.index(after: separator)...]))
+        guard !name.isEmpty, fields.count >= 3, fields[0].lowercased() == "masque",
+              let port = Int(fields[2]), (1...65535).contains(port) else { return nil }
+        let host = normalizedHost(fields[1])
+        guard !host.isEmpty, !host.contains(where: { $0.isWhitespace || ",/\\@?#=".contains($0) }) else { return nil }
+        let allowed: Set<String> = ["username", "password", "sni", "alpn", "skip-cert-verify", "server-cert-fingerprint-sha256"]
+        var options: [String: String] = [:]
+        for field in fields.dropFirst(3) {
+            guard let equals = field.firstIndex(of: "=") else { return nil }
+            let key = String(field[..<equals]).trimmingCharacters(in: .whitespaces).lowercased()
+            let value = surgeProxyScalar(String(field[field.index(after: equals)...]), decodePercent: false)
+            guard allowed.contains(key), options[key] == nil,
+                  !value.contains(where: { $0.isNewline || $0 == "\0" || $0 == "," }) else { return nil }
+            options[key] = value
+        }
+        if let sni = options["sni"], sni.contains(where: { $0.isWhitespace || ",/%\\@?#=".contains($0) }) { return nil }
+        if let value = options["skip-cert-verify"], !["true", "false", "1", "0", "yes", "no"].contains(value.lowercased()) { return nil }
+        if let pin = options["server-cert-fingerprint-sha256"] {
+            let compact = pin.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: "-", with: "")
+            guard compact.count == 64, compact.allSatisfy({ $0.isASCII && $0.isHexDigit }) else { return nil }
+        }
+        let node = ProxyNode(sourceID: sourceID, kind: .masque, name: name, server: host, port: port,
+                         password: options["password"], username: options["username"], tls: true,
+                         sni: options["sni"], alpn: options["alpn"],
+                         certificateFingerprint: options["server-cert-fingerprint-sha256"],
+                         skipCertificateVerification: boolString(options["skip-cert-verify"]),
+                         rawURI: raw)
+        return node.hasSupportedMASQUEFields ? node : nil
+    }
+
+    private func parseSurgeShadowsocksLine(
+        _ raw: String,
+        sourceID: UUID?
+    ) -> ProxyNode? {
+        guard let separator = raw.firstIndex(of: "=") else { return nil }
+        let name = String(raw[..<separator]).trimmingCharacters(in: .whitespaces)
+        let fields = surgeProxyFields(String(raw[raw.index(after: separator)...]))
+        guard !name.isEmpty,
+              fields.count >= 3,
+              fields[0].lowercased() == "ss",
+              !fields[1].isEmpty,
+              let port = Int(fields[2]) else { return nil }
+
+        var options: [String: String] = [:]
+        for field in fields.dropFirst(3) {
+            guard let equals = field.firstIndex(of: "=") else { continue }
+            let key = String(field[..<equals])
+                .trimmingCharacters(in: .whitespaces)
+                .lowercased()
+            let value = surgeProxyScalar(String(field[field.index(after: equals)...]))
+            options[key] = value
+        }
+
+        guard let cipher = options["encrypt-method"] ?? options["method"] ?? options["cipher"],
+              !cipher.isEmpty,
+              let password = options["password"],
+              !password.isEmpty else { return nil }
+
+        var shadowTLS: ShadowTLSOptions?
+        if options.keys.contains(where: { $0.hasPrefix("shadow-tls-") }) {
+            let keys = Set(options.keys.filter { $0.hasPrefix("shadow-tls-") })
+            guard keys.isSubset(of: ["shadow-tls-version", "shadow-tls-sni", "shadow-tls-password"]) else { return nil }
+            let fields = ["version": options["shadow-tls-version"] ?? "2",
+                          "host": options["shadow-tls-sni"] ?? "",
+                          "password": options["shadow-tls-password"] ?? ""]
+            guard let parsed = shadowTLSOptions(fields) else { return nil }
+            shadowTLS = parsed
+        }
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .shadowsocks,
+            name: normalizedName(name, fallback: fields[1]),
+            server: normalizedHost(fields[1]),
+            port: port,
+            cipher: cipher,
+            password: password,
+            plugin: shadowTLS == nil ? nil : "shadow-tls",
+            shadowTLS: shadowTLS,
+            obfs: options["obfs"],
+            obfsParam: options["obfs-host"],
+            udpRelayEnabled: boolString(options["udp-relay"] ?? options["udp"]),
+            rawURI: raw
+        )
+    }
+
+    private func surgeProxyFields(_ value: String) -> [String] {
+        var fields: [String] = []
+        var current = ""
+        var quote: Character?
+
+        for character in value {
+            if character == "\"" || character == "'" {
+                if quote == character { quote = nil }
+                else if quote == nil { quote = character }
+                current.append(character)
+            } else if character == ",", quote == nil {
+                fields.append(surgeProxyScalar(current, decodePercent: false))
+                current = ""
+            } else {
+                current.append(character)
+            }
+        }
+        fields.append(surgeProxyScalar(current, decodePercent: false))
+        return fields
+    }
+
+    private func surgeProxyScalar(_ value: String, decodePercent: Bool = true) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let unquoted: String
+        if trimmed.count >= 2,
+           let first = trimmed.first,
+           let last = trimmed.last,
+           (first == "\"" || first == "'"),
+           first == last {
+            unquoted = String(trimmed.dropFirst().dropLast())
+        } else {
+            unquoted = trimmed
+        }
+        return decodePercent ? (unquoted.removingPercentEncoding ?? unquoted) : unquoted
+    }
+
+    func parseURI(_ rawValue: String, sourceID: UUID? = nil) -> ProxyNode? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = value.lowercased()
+        // Snell has no URI form at all. It is shared as the Surge proxy line it
+        // is written as, so that line is what Tower accepts.
+        if let masque = parseMASQUELine(value, sourceID: sourceID) { return masque }
+        if let snell = parseSnellLine(value, sourceID: sourceID) { return snell }
+        if lowercased.hasPrefix("ss://") { return parseShadowsocks(value, sourceID: sourceID) }
+        if lowercased.hasPrefix("ssr://") { return parseShadowsocksR(value, sourceID: sourceID) }
+        if lowercased.hasPrefix("vmess://") { return parseVMess(value, sourceID: sourceID) }
+        if lowercased.hasPrefix("vless://") {
+            return parseStandardURL(value, kind: .vless, sourceID: sourceID)
+                ?? parseLegacyVLESS(value, sourceID: sourceID)
+        }
+        if lowercased.hasPrefix("trojan://") { return parseStandardURL(value, kind: .trojan, sourceID: sourceID) }
+        if lowercased.hasPrefix("anytls://") { return parseStandardURL(value, kind: .anytls, sourceID: sourceID) }
+        if lowercased.hasPrefix("hysteria2://") || lowercased.hasPrefix("hy2://") {
+            return parseStandardURL(value, kind: .hysteria2, sourceID: sourceID)
+        }
+        // Checked after hysteria2 so `hysteria2://` never falls in here.
+        if lowercased.hasPrefix("hysteria://") || lowercased.hasPrefix("hy://") {
+            return parseStandardURL(value, kind: .hysteria, sourceID: sourceID)
+        }
+        if lowercased.hasPrefix("tuic://") { return parseStandardURL(value, kind: .tuic, sourceID: sourceID) }
+        if lowercased.hasPrefix("wireguard://") || lowercased.hasPrefix("wg://") {
+            return parseWireGuardURL(value, sourceID: sourceID)
+        }
+        if lowercased.hasPrefix("socks5://") || lowercased.hasPrefix("socks://") {
+            return parseStandardURL(value, kind: .socks5, sourceID: sourceID)
+        }
+        if lowercased.hasPrefix("http://") || lowercased.hasPrefix("https://") {
+            // Shadowrocket also exports HTTP(S) nodes as
+            // `https://base64(user:password@host:port)?remarks=...`. Try that
+            // dialect before the standard URL form; otherwise the encoded
+            // authority itself can be mistaken for the proxy hostname.
+            return parseShadowrocketHTTPURL(value, sourceID: sourceID)
+                ?? parseStandardURL(value, kind: .http, sourceID: sourceID)
+        }
+        return nil
+    }
+
+    /// Sub-Store's portable single-peer URI. A WireGuard endpoint is not a
+    /// generic username/password proxy: the local address and allowed routes
+    /// are required to make the tunnel meaningful, so every field is retained.
+    private func parseWireGuardURL(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        let normalized = raw.lowercased().hasPrefix("wg://")
+            ? "wireguard://" + raw.dropFirst("wg://".count)
+            : raw
+        guard let components = URLComponents(string: normalized),
+              let rawHost = components.host, !rawHost.isEmpty else { return nil }
+        let query = Dictionary((components.queryItems ?? []).map {
+            ($0.name.lowercased(), $0.value ?? "")
+        }) { _, new in new }
+        // An AmneziaWG link cannot be expressed as plain WireGuard.
+        guard !query.keys.contains(where: Self.isAmneziaWireGuardKey) else { return nil }
+        let addresses = csvValues(query["address"] ?? query["addresses"] ?? "")
+        let ipv4 = addresses.first { !$0.contains(":") }
+        let ipv6 = addresses.first { $0.contains(":") }
+        let server = normalizedHost(rawHost)
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .wireguard,
+            name: normalizedName(components.fragment?.removingPercentEncoding, fallback: "WireGuard · \(server)"),
+            server: server,
+            port: components.port ?? 51_820,
+            wireGuardPrivateKey: components.user,
+            wireGuardPublicKey: query["publickey"] ?? query["public-key"],
+            wireGuardPreSharedKey: query["presharedkey"] ?? query["pre-shared-key"] ?? query["preshared-key"],
+            wireGuardIPv4: ipv4,
+            wireGuardIPv6: ipv6,
+            wireGuardAllowedIPs: csvValues(query["allowedips"] ?? query["allowed-ips"] ?? "0.0.0.0/0,::/0").joined(separator: ","),
+            wireGuardReserved: csvValues(query["reserved"] ?? "").joined(separator: ","),
+            wireGuardMTU: Int(query["mtu"] ?? ""),
+            wireGuardPersistentKeepalive: Int(query["keepalive"] ?? query["persistent-keepalive"] ?? ""),
+            wireGuardDNS: csvValues(query["dns"] ?? query["dns-server"] ?? "").joined(separator: ","),
+            rawURI: raw
+        )
+    }
+
+    private func parseShadowsocks(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        let fragmentSplit = raw.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)
+        let name = fragmentSplit.count > 1
+            ? String(fragmentSplit[1]).removingPercentEncoding ?? String(fragmentSplit[1])
+            : "Shadowsocks"
+        var payload = String(fragmentSplit[0]).replacingOccurrences(of: "ss://", with: "", options: [.anchored, .caseInsensitive])
+        var obfsMode: String?
+        var obfsHost: String?
+        var sip003Plugin: String?
+        var pluginTransport: String?
+        var pluginPath: String?
+        var pluginTLS = false
+        var pluginMux: Bool?
+        var shadowTLS: ShadowTLSOptions?
+        var shadowTLSFingerprint: String?
+        var udpRelayEnabled: Bool?
+        if let queryIndex = payload.firstIndex(of: "?") {
+            let query = String(payload[payload.index(after: queryIndex)...])
+            let parameters = queryDictionary(query)
+            udpRelayEnabled = (parameters["udp-relay"] ?? parameters["udp"]).map { boolString($0) }
+            // Plugins change the wire protocol. Parse only modelled options;
+            // unknown plugins must never turn into an ordinary SS node.
+            if let plugin = queryDictionary(query)["plugin"]?.removingPercentEncoding,
+               !plugin.isEmpty {
+                if plugin.lowercased().hasPrefix("shadow-tls;") {
+                    guard !boolString(parameters["udp-over-tcp"]),
+                          let options = shadowTLSPluginOptions(plugin) else { return nil }
+                    shadowTLS = options
+                    shadowTLSFingerprint = parameters["client-fingerprint"]?.removingPercentEncoding
+                    sip003Plugin = "shadow-tls"
+                } else if let options = simpleObfsOptions(from: plugin) {
+                    obfsMode = options.mode
+                    obfsHost = options.host
+                } else if let options = v2rayPluginOptions(from: plugin) {
+                    sip003Plugin = "v2ray-plugin"
+                    pluginTransport = options.transport
+                    obfsHost = options.host
+                    pluginPath = options.path
+                    pluginTLS = options.tls
+                    pluginMux = options.mux
+                } else {
+                    return nil
+                }
+            }
+            payload = String(payload[..<queryIndex])
+        }
+
+        var auth: String
+        var endpoint: String
+        if let atIndex = payload.lastIndex(of: "@") {
+            let encodedAuth = String(payload[..<atIndex])
+            auth = decodeBase64String(encodedAuth) ?? encodedAuth.removingPercentEncoding ?? encodedAuth
+            endpoint = String(payload[payload.index(after: atIndex)...])
+        } else if let decoded = decodeBase64String(payload), let atIndex = decoded.lastIndex(of: "@") {
+            auth = String(decoded[..<atIndex])
+            endpoint = String(decoded[decoded.index(after: atIndex)...])
+        } else {
+            return nil
+        }
+
+        guard let separator = auth.firstIndex(of: ":") else { return nil }
+        let method = String(auth[..<separator])
+        let password = String(auth[auth.index(after: separator)...])
+        guard let address = parseEndpoint(endpoint) else { return nil }
+
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .shadowsocks,
+            name: normalizedName(name, fallback: address.host),
+            server: address.host,
+            port: address.port,
+            cipher: method,
+            password: password,
+            transport: pluginTransport,
+            plugin: sip003Plugin,
+            pluginMux: pluginMux,
+            shadowTLS: shadowTLS,
+            tls: pluginTLS,
+            hostHeader: obfsHost,
+            path: pluginPath,
+            fingerprint: shadowTLSFingerprint,
+            obfs: obfsMode,
+            obfsParam: sip003Plugin == nil ? obfsHost : nil,
+            udpRelayEnabled: udpRelayEnabled,
+            rawURI: raw
+        )
+    }
+
+    private func shadowTLSOptions(_ options: [String: String]) -> ShadowTLSOptions? {
+        let known: Set<String> = ["version", "host", "password", "skip-cert-verify"]
+        guard Set(options.keys).isSubset(of: known),
+              let version = Int(options["version"] ?? ""),
+              let host = options["host"] else { return nil }
+        let result = ShadowTLSOptions(version: version, host: host,
+                                      password: options["password"] ?? "",
+                                      skipCertificateVerification: boolString(options["skip-cert-verify"]))
+        return result.isValid ? result : nil
+    }
+
+    /// SIP003 escapes semicolons and backslashes inside option values, so a
+    /// WebSocket path written as `path=/foo\;bar` is one field, not two.
+    private func sip003Fields(_ plugin: String) -> [String]? {
+        var parts = [String]()
+        var part = ""
+        var escaped = false
+        for character in plugin {
+            if escaped { part.append(character); escaped = false }
+            else if character == "\\" { escaped = true }
+            else if character == ";" { parts.append(part); part = "" }
+            else { part.append(character) }
+        }
+        guard !escaped else { return nil }
+        parts.append(part)
+        return parts
+    }
+
+    private func shadowTLSPluginOptions(_ plugin: String) -> ShadowTLSOptions? {
+        guard let parts = sip003Fields(plugin) else { return nil }
+        var options = [String: String]()
+        for field in parts.dropFirst() {
+            guard let equals = field.firstIndex(of: "=") else { return nil }
+            let key = String(field[..<equals]).lowercased()
+            guard options[key] == nil else { return nil }
+            options[key] = String(field[field.index(after: equals)...])
+        }
+        return shadowTLSOptions(options)
+    }
+
+    /// Reads a SIP003 plugin string such as
+    /// `obfs-local;obfs=http;obfs-host=www.example.com`.
+    /// Returns nil for plugins Tower cannot reproduce faithfully.
+    private func simpleObfsOptions(from plugin: String) -> (mode: String, host: String?)? {
+        guard let fields = sip003Fields(plugin) else { return nil }
+        let parts = fields.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard let name = parts.first?.lowercased(),
+              ["obfs", "obfs-local", "simple-obfs"].contains(name) else { return nil }
+
+        var mode = "http"
+        var host: String?
+        for part in parts.dropFirst() {
+            let pair = part.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { continue }
+            let key = pair[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = pair[1].trimmingCharacters(in: .whitespaces)
+            if key == "obfs" || key == "mode" {
+                mode = value
+            } else if key == "obfs-host" || key == "host" {
+                host = value
+            }
+        }
+        return (mode, host)
+    }
+
+    private func v2rayPluginOptions(
+        from plugin: String
+    ) -> (transport: String, host: String?, path: String?, tls: Bool, mux: Bool?)? {
+        guard let parts = sip003Fields(plugin)?.map({ $0.trimmingCharacters(in: .whitespaces) }),
+              parts.first?.lowercased() == "v2ray-plugin" else { return nil }
+        var mode = "websocket"
+        var host: String?
+        var path: String?
+        var tls = false
+        var mux: Bool?
+        for part in parts.dropFirst() {
+            let pair = part.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            let key = pair[0].lowercased()
+            if pair.count == 1 {
+                if key == "tls" { tls = true }
+                continue
+            }
+            let value = String(pair[1])
+            switch key {
+            case "mode", "obfs": mode = value
+            case "host", "obfs-host": host = value
+            case "path": path = value
+            case "tls": tls = boolString(value)
+            case "mux": mux = boolString(value)
+            default: break
+            }
+        }
+        guard ["websocket", "ws"].contains(mode.lowercased()) else { return nil }
+        return ("ws", host, path, tls, mux)
+    }
+
+    private func parseShadowsocksR(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        let encoded = String(raw.dropFirst("ssr://".count))
+        guard let decoded = decodeBase64String(encoded) else { return nil }
+        let sections = decoded.components(separatedBy: "/?")
+        // SSR has five colon-delimited fields after the host. Split from the
+        // right so a bare or bracketed IPv6 address remains a single field.
+        let main = String(sections[0].reversed())
+            .split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false)
+            .reversed().map { String($0.reversed()) }
+        guard main.count == 6, let port = Int(main[1]), let password = decodeBase64String(main[5]) else { return nil }
+
+        let query = sections.count > 1 ? queryDictionary(sections[1]) : [:]
+        let remarks = query["remarks"].flatMap(decodeBase64String) ?? main[0]
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .shadowsocksR,
+            name: normalizedName(remarks, fallback: main[0]),
+            server: normalizedHost(main[0]),
+            port: port,
+            cipher: main[3],
+            password: password,
+            protocolName: main[2],
+            protocolParam: query["protoparam"].flatMap(decodeBase64String),
+            obfs: main[4],
+            obfsParam: query["obfsparam"].flatMap(decodeBase64String),
+            rawURI: raw
+        )
+    }
+
+    private func parseVMess(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        let encoded = String(raw.dropFirst("vmess://".count))
+        guard let decoded = decodeBase64String(encoded.split(separator: "?", maxSplits: 1).first.map(String.init) ?? encoded),
+              let data = decoded.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let server = stringValue(json["add"]),
+              let port = intValue(json["port"]),
+              let uuid = stringValue(json["id"]) else {
+            // Not the base64-JSON form. Shadowrocket and friends instead encode
+            // `method:uuid@host:port` and hang the rest off a query string.
+            return parseLegacyVMess(raw, sourceID: sourceID)
+        }
+
+        let tlsValue = stringValue(json["tls"])?.lowercased()
+        let network = stringValue(json["net"]) ?? stringValue(json["network"])
+        let headerType = stringValue(json["type"])
+        let transport: String? = switch (network?.lowercased(), headerType?.lowercased()) {
+        // v2rayN's HTTP/1.1 header obfuscation is `net: tcp` plus `type: http`;
+        // reading only `net` imported it as plain TCP, which never connects.
+        case (nil, "http"), ("tcp", "http"), ("raw", "http"): "http"
+        // Xray names its HTTP/2 transport `http`; `h2` is the other spelling.
+        case ("http", _): "h2"
+        default: normalizedVMessTransport(network ?? headerType)
+        }
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .vmess,
+            name: normalizedName(stringValue(json["ps"]), fallback: server),
+            server: server,
+            port: port,
+            cipher: stringValue(json["scy"]) ?? "auto",
+            uuid: uuid,
+            transport: transport ?? "tcp",
+            tls: tlsValue == "tls" || tlsValue == "true",
+            sni: stringValue(json["sni"]),
+            hostHeader: stringValue(json["host"]),
+            path: stringValue(json["path"]),
+            alpn: stringValue(json["alpn"]),
+            skipCertificateVerification: boolValue(json["allowInsecure"]),
+            alterID: intValue(json["aid"]),
+            rawURI: raw
+        )
+    }
+
+    /// Xray's XHTTP `extra` JSON (headers, padding, XMUX, split download…)
+    /// changes what goes on the wire. Tower keeps only mode, path and host, so
+    /// a link carrying a non-empty `extra` is rejected instead of exported as
+    /// a node that looks fine and cannot connect.
+    static func xhttpExtraIsEmpty(_ extra: String?) -> Bool {
+        guard let extra = extra?.trimmingCharacters(in: .whitespacesAndNewlines), !extra.isEmpty else { return true }
+        guard let object = try? JSONSerialization.jsonObject(with: Data(extra.utf8)) as? [String: Any] else { return false }
+        return object.isEmpty
+    }
+
+    /// mihomo's `xhttp-opts` beyond path / host / mode (and a Host-only
+    /// `headers`) cannot be carried through Tower's node model.
+    func clashXHTTPOptionsAreExpressible(_ raw: [String: String]) -> Bool {
+        let allowed: Set<String> = ["path", "host", "mode"]
+        func headersAreHostOnly(_ value: String) -> Bool {
+            parseInlineYAMLMap(value).keys.allSatisfy { $0.lowercased() == "host" }
+        }
+        var keys: [(String, String)] = raw.compactMap { key, value in
+            key.hasPrefix("xhttp-opts.") ? (String(key.dropFirst("xhttp-opts.".count)), value) : nil
+        }
+        if let inline = raw["xhttp-opts"] {
+            keys += parseInlineYAMLMap(inline).map { ($0.key, $0.value) }
+        }
+        // The block-style reader flattens nested maps onto the proxy, so
+        // xhttp-only keys (wiki.metacubex.one, xhttp-opts) show up there.
+        let xhttpOnly: Set<String> = ["download-settings", "reuse-settings", "xmux", "no-grpc-header",
+                                       "x-padding-bytes", "sc-max-each-post-bytes", "sc-min-posts-interval-ms",
+                                       "sc-max-buffered-posts", "sc-stream-up-server-secs"]
+        if raw.keys.contains(where: { xhttpOnly.contains($0.lowercased()) }) { return false }
+        return keys.allSatisfy { key, value in
+            let lower = key.lowercased()
+            if allowed.contains(lower) { return true }
+            if lower == "headers" { return headersAreHostOnly(value) }
+            if lower.hasPrefix("headers.") { return lower == "headers.host" }
+            return false
+        }
+    }
+
+    /// Snell v6 `mode` (manual.nssurge.com/policies/snell.html) must match
+    /// the server. Tower stores no mode, so only the default — written or
+    /// omitted — can be exported faithfully; `unshaped` / `unsafe-raw` nodes
+    /// are rejected rather than exported as a v6 node that cannot connect.
+    static func snellModeIsDefault(_ mode: String?) -> Bool {
+        guard let mode = mode?.trimmingCharacters(in: .whitespaces), !mode.isEmpty else { return true }
+        return mode.lowercased() == "default"
+    }
+
+    /// A Surge proxy line: `名称 = snell, 主机, 端口, psk=…, version=4, obfs=http`.
+    ///
+    /// Positional fields come first, then `key=value` options in any order.
+    private func parseSnellLine(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        guard let separator = raw.firstIndex(of: "=") else { return nil }
+        let name = String(raw[..<separator]).trimmingCharacters(in: .whitespaces)
+        let body = String(raw[raw.index(after: separator)...])
+        let fields = body.components(separatedBy: ",").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard !name.isEmpty,
+              fields.first?.lowercased() == "snell",
+              fields.count >= 3,
+              let port = Int(fields[2]) else { return nil }
+
+        let server = normalizedHost(fields[1])
+        guard !server.isEmpty else { return nil }
+
+        var options: [String: String] = [:]
+        for field in fields.dropFirst(3) {
+            guard let equals = field.firstIndex(of: "=") else { continue }
+            let key = String(field[..<equals]).trimmingCharacters(in: .whitespaces).lowercased()
+            let value = String(field[field.index(after: equals)...])
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            options[key] = value
+        }
+        guard let psk = options["psk"], !psk.isEmpty,
+              Self.snellModeIsDefault(options["mode"]) else { return nil }
+
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .snell,
+            name: name,
+            server: server,
+            port: port,
+            password: psk,
+            hostHeader: options["obfs-host"],
+            obfs: options["obfs"],
+            obfsParam: options["obfs-host"],
+            version: Int(options["version"] ?? ""),
+            rawURI: raw
+        )
+    }
+
+    /// `vmess://base64(method:uuid@host:port)?remarks=…&obfs=…&tls=1`.
+    ///
+    /// Only the endpoint is base64; the options stay readable in the query, and
+    /// the transport is named `obfs` rather than `net`.
+    private func parseLegacyVMess(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        var body = String(raw.dropFirst("vmess://".count))
+        if let fragment = body.firstIndex(of: "#") { body = String(body[..<fragment]) }
+
+        let parts = body.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let decoded = decodeBase64String(String(parts[0])) else { return nil }
+        let query = parts.count > 1
+            ? Dictionary(
+                queryDictionary(String(parts[1])).map { ($0.key.lowercased(), $0.value) },
+                uniquingKeysWith: { _, new in new }
+            )
+            : [:]
+
+        guard let atIndex = decoded.lastIndex(of: "@") else { return nil }
+        let auth = String(decoded[..<atIndex])
+        guard let address = parseEndpoint(String(decoded[decoded.index(after: atIndex)...])) else {
+            return nil
+        }
+
+        // The credential half is `method:uuid`; a bare uuid is also accepted.
+        let cipher: String
+        let uuid: String
+        if let separator = auth.firstIndex(of: ":") {
+            cipher = String(auth[..<separator])
+            uuid = String(auth[auth.index(after: separator)...])
+        } else {
+            cipher = "auto"
+            uuid = auth
+        }
+        guard !uuid.isEmpty else { return nil }
+
+        let obfs = query["obfs"]?.removingPercentEncoding
+        let transport = normalizedVMessTransport(obfs)
+        let name = query["remarks"]?.removingPercentEncoding
+            ?? raw.split(separator: "#", maxSplits: 1).dropFirst().first
+                .map(String.init)?.removingPercentEncoding
+
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .vmess,
+            name: normalizedName(name, fallback: address.host),
+            server: address.host,
+            port: address.port,
+            cipher: cipher.isEmpty ? "auto" : cipher,
+            uuid: uuid,
+            transport: transport,
+            tls: ["1", "true", "tls"].contains(query["tls"]?.lowercased() ?? ""),
+            sni: query["peer"]?.removingPercentEncoding ?? query["sni"]?.removingPercentEncoding,
+            hostHeader: transport == "ws"
+                ? webSocketHost(from: query["obfsparam"] ?? query["host"])
+                : (query["obfsparam"]?.removingPercentEncoding ?? query["host"]?.removingPercentEncoding),
+            path: query["path"]?.removingPercentEncoding,
+            skipCertificateVerification: ["1", "true"].contains(
+                query["allowinsecure"]?.lowercased() ?? query["tls-verification"]?.lowercased() ?? ""
+            ),
+            alterID: Int(query["alterid"] ?? ""),
+            rawURI: raw
+        )
+    }
+
+    private func normalizedVMessTransport(_ value: String?) -> String? {
+        guard let value = value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !value.isEmpty else { return nil }
+        return switch value {
+        case "websocket", "ws": "ws"
+        case "http2": "h2"
+        case "http-upgrade", "httpupgrade": "httpupgrade"
+        case "splithttp": "xhttp"
+        case "none": nil
+        default: value
+        }
+    }
+
+    /// The transport a VLESS or Trojan share link names. The Xray link
+    /// standard gives `type=http` to its HTTP/2 transport, and spells HTTP/1.1
+    /// header obfuscation as `type=tcp` with `headerType=http`. Reading
+    /// `http` as HTTP/1.1 and ignoring `headerType` turned both into a
+    /// different wire protocol.
+    private func standardLinkTransport(
+        _ transport: String?,
+        type: String?,
+        headerType: String?,
+        kind: ProxyKind
+    ) -> String? {
+        guard [.vless, .trojan].contains(kind) else { return transport }
+        if type?.lowercased() == "http" { return "h2" }
+        if transport == nil, headerType?.lowercased() == "http" { return "http" }
+        return transport
+    }
+
+    private func normalizedTransport(_ value: String?) -> String? {
+        guard let value = value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(), !value.isEmpty else { return nil }
+        return switch value {
+        case "tcp", "none": nil
+        case "websocket", "ws": "ws"
+        case "http2": "h2"
+        case "http-upgrade", "httpupgrade": "httpupgrade"
+        case "splithttp": "xhttp"
+        default: value
+        }
+    }
+
+    /// `vless://base64(uuid@host:port)?remarks=…&tls=1&pbk=…&xtls=2`.
+    ///
+    /// Shadowrocket exports this endpoint-only Base64 dialect instead of the
+    /// standard VLESS URL authority form. Its REALITY option names also differ
+    /// from the Xray vocabulary used by standard VLESS links.
+    private func parseLegacyVLESS(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        var body = String(raw.dropFirst("vless://".count))
+        let fragmentName: String?
+        if let fragment = body.firstIndex(of: "#") {
+            fragmentName = String(body[body.index(after: fragment)...]).removingPercentEncoding
+            body = String(body[..<fragment])
+        } else {
+            fragmentName = nil
+        }
+
+        let parts = body.split(separator: "?", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let decoded = decodeBase64String(String(parts[0])),
+              let atIndex = decoded.lastIndex(of: "@") else { return nil }
+        let rawUUID = String(decoded[..<atIndex])
+        let uuid: String
+        if rawUUID.lowercased().hasPrefix("auto:") {
+            uuid = String(rawUUID.dropFirst("auto:".count))
+        } else if rawUUID.lowercased().hasPrefix("none:") {
+            // Shadowrocket may preserve VLESS's `encryption=none` marker in
+            // its Base64 authority as `none:uuid@host:port`. It is not part of
+            // the UUID; retaining it makes an otherwise valid node impossible
+            // to export to every target client.
+            uuid = String(rawUUID.dropFirst("none:".count))
+        } else if rawUUID.hasPrefix(":") {
+            uuid = String(rawUUID.dropFirst())
+        } else {
+            uuid = rawUUID
+        }
+        guard !uuid.isEmpty,
+              let address = parseEndpoint(String(decoded[decoded.index(after: atIndex)...])) else {
+            return nil
+        }
+
+        let rawQuery = parts.count > 1 ? queryDictionary(String(parts[1])) : [:]
+        let query = Dictionary(rawQuery.map { ($0.key.lowercased(), $0.value) }) { _, new in new }
+        let realityPublicKey = query["pbk"]?.removingPercentEncoding
+        let tlsValue = (query["security"] ?? query["tls"] ?? "").lowercased()
+        let rawTransport = (query["type"] ?? query["network"] ?? query["obfs"])?
+            .removingPercentEncoding?.lowercased()
+        let transport = normalizedTransport(rawTransport)
+        if transport == "xhttp", !Self.xhttpExtraIsEmpty(query["extra"]?.removingPercentEncoding) { return nil }
+        let flow = query["flow"]?.removingPercentEncoding
+            ?? (query["xtls"] == "2" ? "xtls-rprx-vision" : nil)
+        let name = proxyNameQueryValue(query) ?? fragmentName
+
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .vless,
+            name: normalizedName(name, fallback: address.host),
+            server: address.host,
+            port: address.port,
+            uuid: uuid,
+            transport: transport,
+            transportMode: transport == "xhttp" ? query["mode"]?.removingPercentEncoding : nil,
+            tls: !((realityPublicKey ?? "").isEmpty)
+                || ["1", "true", "tls", "reality"].contains(tlsValue),
+            sni: (query["peer"] ?? query["sni"] ?? query["servername"])?
+                .removingPercentEncoding,
+            hostHeader: (query["authority"] ?? query["host"])?.removingPercentEncoding
+                ?? (transport == "ws" ? webSocketHost(from: query["obfsparam"]) : nil),
+            path: (transport == "grpc" ? query["servicename"] ?? query["service_name"] : query["path"])?.removingPercentEncoding,
+            alpn: query["alpn"]?.removingPercentEncoding,
+            realityPublicKey: realityPublicKey,
+            realityShortID: query["sid"]?.removingPercentEncoding,
+            certificateFingerprint: (query["pcs"] ?? query["pinsha256"] ?? query["pin-sha256"])?
+                .removingPercentEncoding,
+            // Shadowrocket's legacy REALITY URI spells the uTLS value
+            // `fingerprint`; ordinary VLESS uses the unambiguous `fp` key.
+            fingerprint: (query["fp"]
+                ?? (!((realityPublicKey ?? "").isEmpty) ? query["fingerprint"] : nil))?
+                .removingPercentEncoding,
+            flow: flow,
+            skipCertificateVerification: ["1", "true"].contains(
+                query["allowinsecure"]?.lowercased() ?? query["insecure"]?.lowercased() ?? ""
+            ),
+            rawURI: raw
+        )
+    }
+
+    private func parseShadowrocketHTTPURL(_ raw: String, sourceID: UUID?) -> ProxyNode? {
+        let lowercased = raw.lowercased()
+        let scheme: String
+        if lowercased.hasPrefix("https://") {
+            scheme = "https"
+        } else if lowercased.hasPrefix("http://") {
+            scheme = "http"
+        } else {
+            return nil
+        }
+
+        let body = String(raw.dropFirst(scheme.count + "://".count))
+        let authorityEnd = body.firstIndex(where: { $0 == "?" || $0 == "#" }) ?? body.endIndex
+        let encodedAuthority = String(body[..<authorityEnd])
+        // A standard proxy already contains `@`. Requiring `@` in the decoded
+        // value prevents an ordinary subscription hostname from being treated
+        // as an encoded HTTP proxy by coincidence.
+        guard !encodedAuthority.isEmpty,
+              !encodedAuthority.contains("@"),
+              let decodedAuthority = decodeBase64String(encodedAuthority),
+              decodedAuthority.contains("@"),
+              let components = URLComponents(string: "\(scheme)://\(decodedAuthority)"),
+              let rawHost = components.host else { return nil }
+
+        let remainder = String(body[authorityEnd...])
+        let fragment: String?
+        let queryText: String?
+        if let fragmentIndex = remainder.firstIndex(of: "#") {
+            fragment = String(remainder[remainder.index(after: fragmentIndex)...]).removingPercentEncoding
+            let beforeFragment = String(remainder[..<fragmentIndex])
+            queryText = beforeFragment.hasPrefix("?") ? String(beforeFragment.dropFirst()) : nil
+        } else {
+            fragment = nil
+            queryText = remainder.hasPrefix("?") ? String(remainder.dropFirst()) : nil
+        }
+        let rawQuery = queryText.map(queryDictionary) ?? [:]
+        let query = Dictionary(rawQuery.map { ($0.key.lowercased(), $0.value) }) { _, new in new }
+        let innerQuery = Dictionary((components.queryItems ?? []).map {
+            ($0.name.lowercased(), $0.value ?? "")
+        }) { _, new in new }
+        let server = normalizedHost(rawHost)
+        let port = components.port ?? (scheme == "https" ? 443 : 80)
+        let outerRemarks = proxyNameQueryValue(query)
+        let innerRemarks = proxyNameQueryValue(innerQuery)
+        let name = outerRemarks
+            ?? decodedProxyName(fragment, mayBeBase64: false)
+            ?? innerRemarks
+            ?? decodedProxyName(components.fragment, mayBeBase64: false)
+
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: .http,
+            name: normalizedName(name, fallback: "HTTP · \(server)"),
+            server: server,
+            port: port,
+            password: components.password,
+            username: components.user,
+            tls: scheme == "https",
+            rawURI: raw
+        )
+    }
+
+    private func parseStandardURL(_ raw: String, kind: ProxyKind, sourceID: UUID?) -> ProxyNode? {
+        var normalized = raw
+        if normalized.lowercased().hasPrefix("hy2://") {
+            normalized = "hysteria2://" + normalized.dropFirst("hy2://".count)
+        } else if normalized.lowercased().hasPrefix("hy://") {
+            normalized = "hysteria://" + normalized.dropFirst("hy://".count)
+        } else if normalized.lowercased().hasPrefix("socks://") {
+            normalized = "socks5://" + normalized.dropFirst("socks://".count)
+        }
+        // Hysteria 2's own URI format writes port hopping into the port:
+        // `host:443,5000-6000`. URLComponents rejects that, so the whole link
+        // was dropped as unrecognised.
+        var authorityPortHopping: String?
+        if kind == .hysteria2, let split = splitMultiPortAuthority(normalized) {
+            normalized = split.link
+            authorityPortHopping = split.ports
+        }
+        guard let components = URLComponents(string: normalized),
+              let rawHost = components.host else { return nil }
+        let defaultHTTPPort: Int? = kind == .http
+            ? (components.scheme?.lowercased() == "https" ? 443 : 80)
+            : nil
+        guard let port = components.port ?? defaultHTTPPort else { return nil }
+        let server = normalizedHost(rawHost)
+
+        let query = Dictionary((components.queryItems ?? []).map { ($0.name.lowercased(), $0.value ?? "") }) { _, new in new }
+        let fallback = "\(kind.title) · \(server)"
+        let name = normalizedName(
+            decodedProxyName(components.fragment, mayBeBase64: false)
+                ?? proxyNameQueryValue(query),
+            fallback: fallback
+        )
+        let trojanPlugin = kind == .trojan
+            ? query["plugin"].flatMap(shadowrocketTrojanWebSocketOptions)
+            : nil
+        let transport = standardLinkTransport(
+            normalizedTransport(
+                trojanPlugin?.transport
+                    ?? query["type"]
+                    ?? query["network"]
+                    ?? (query["obfs"]?.contains("ws") == true ? "ws" : nil)
+            ),
+            type: trojanPlugin == nil ? query["type"] : nil,
+            headerType: query["headertype"],
+            kind: kind
+        )
+        let security = (query["security"] ?? query["tls"] ?? "").lowercased()
+        // Shadowrocket has two VLESS URL dialects. Its Base64-authority form
+        // is handled above, but it can also keep the standard UUID authority
+        // while using Shadowrocket's query vocabulary (`tls=1`, `xtls=2`,
+        // `fingerprint`). A public key is unambiguous evidence that this VLESS
+        // node is REALITY even when `security=reality` is omitted.
+        let realityPublicKey = query["pbk"]
+        let carriesReality = security == "reality"
+            || (kind == .vless && !((realityPublicKey ?? "").isEmpty))
+        let flow = query["flow"]
+            ?? (kind == .vless && query["xtls"] == "2" ? "xtls-rprx-vision" : nil)
+        // URLComponents and its queryItems have already percent-decoded the
+        // userinfo and query values. Decoding again turns a literal `%41` in a
+        // secret into `A` and drops a secret ending in a bare `%` (issue #41).
+        let credential = components.user
+        // Most TUIC v5 links use `uuid:password@host`, but Shadowrocket-style
+        // subscriptions also exist with a bare authority and both credentials
+        // in the query. Keep the standard form authoritative and fall back to
+        // the query dialect so these nodes do not import with empty secrets.
+        let tuicUUID = [credential, query["uuid"]]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        let tuicPassword = [components.password, query["password"]]
+            .compactMap { $0 }
+            .first { !$0.isEmpty }
+        // Some producers serialize an ALPN array as `alpn[0]=h3` rather than
+        // the usual comma-separated `alpn=h3`. Preserve every indexed item in
+        // order and normalize it to Tower's comma-separated model field.
+        let alpnValues = (components.queryItems ?? []).compactMap { item -> String? in
+            let key = item.name.lowercased()
+            guard key == "alpn" || key == "alpn[]" || (key.hasPrefix("alpn[") && key.hasSuffix("]")) else {
+                return nil
+            }
+            guard let value = item.value, !value.isEmpty else { return nil }
+            return value
+        }
+        let normalizedALPN = ALPNList.normalized(alpnValues)
+
+        // An incomplete TUIC node is not usable by any target client. Reject
+        // it here instead of counting it as a successful import; subscription
+        // loading can then try the provider's Clash compatibility response.
+        if kind == .tuic, tuicUUID == nil || tuicPassword == nil {
+            return nil
+        }
+        if transport == "xhttp", !Self.xhttpExtraIsEmpty(query["extra"]) { return nil }
+
+        return ProxyNode(
+            sourceID: sourceID,
+            kind: kind,
+            name: name,
+            server: server,
+            port: port,
+            // TUIC v5 writes `tuic://uuid:password@host`, so unlike every
+            // other scheme here both halves of the userinfo are meaningful.
+            // Hysteria 1 puts its secret in the query instead of the userinfo.
+            password: kind == .tuic
+                ? tuicPassword
+                : (kind == .hysteria
+                    ? (credential ?? query["auth"] ?? query["auth_str"] ?? query["authstr"])
+                    : ([.trojan, .hysteria2, .anytls].contains(kind)
+                        ? credential
+                        : components.password)),
+            uuid: kind == .tuic
+                ? tuicUUID
+                : ([.vmess, .vless].contains(kind) ? credential : nil),
+            username: [.socks5, .http].contains(kind) ? credential : nil,
+            transport: transport,
+            transportMode: transport == "xhttp" ? query["mode"] : nil,
+            tls: [.trojan, .hysteria, .hysteria2, .tuic, .anytls].contains(kind)
+                || ["1", "true", "tls", "reality"].contains(security)
+                || carriesReality
+                || normalized.lowercased().hasPrefix("https://"),
+            sni: query["sni"] ?? query["servername"] ?? query["peer"],
+            hostHeader: trojanPlugin?.host
+                ?? query["authority"]
+                ?? query["host"]
+                ?? (kind == .vless && transport == "ws"
+                    ? webSocketHost(from: query["obfsparam"])
+                    : nil),
+            path: transport == "grpc"
+                ? query["servicename"] ?? query["service_name"] ?? query["path"]
+                : trojanPlugin?.path ?? query["path"],
+            alpn: normalizedALPN,
+            // REALITY. `pbk` is the required server public key; `sid` is the
+            // short id and may legitimately be empty. Preserve both exactly.
+            realityPublicKey: carriesReality ? realityPublicKey : nil,
+            realityShortID: carriesReality ? query["sid"] : nil,
+            certificateFingerprint: query["pinsha256"]
+                ?? query["pin-sha256"]
+                ?? query["tls-fingerprint"]
+                ?? query["pcs"]
+                ?? (kind == .hysteria2 ? query["fingerprint"] : nil),
+            fingerprint: query["fp"]
+                ?? query["client_fingerprint"]
+                ?? query["client-fingerprint"]
+                ?? (carriesReality ? query["fingerprint"] : nil),
+            flow: flow,
+            skipCertificateVerification: ["1", "true"].contains(
+                query["allowinsecure"] ?? query["insecure"] ?? query["allow_insecure"] ?? ""
+            ),
+            protocolName: kind == .hysteria ? query["protocol"] : nil,
+            // Hysteria 1's obfs is a single shared string, not Hysteria 2's
+            // (method, password) pair, so it lives in `obfs` alone.
+            // With `obfs=xplus` the shared key is in `obfsParam`; Mihomo and
+            // sing-box both want that key, not the mode name.
+            obfs: kind == .hysteria
+                ? query["obfsparam"] ?? query["obfs"]
+                : (kind == .hysteria2 ? query["obfs"] : nil),
+            obfsParam: kind == .hysteria2
+                ? query["obfs-password"] ?? query["obfspassword"] ?? query["obfs_password"]
+                : nil,
+            idleSessionCheckInterval: kind == .anytls
+                ? Int(query["idle-session-check-interval"] ?? query["idlesessioncheckinterval"] ?? "")
+                : nil,
+            idleSessionTimeout: kind == .anytls
+                ? Int(query["idle-session-timeout"] ?? query["idlesessiontimeout"] ?? "")
+                : nil,
+            minIdleSession: kind == .anytls
+                ? Int(query["min-idle-session"] ?? query["minidlesession"] ?? "")
+                : nil,
+            congestionControl: kind == .tuic
+                ? query["congestion_control"] ?? query["congestion-controller"]
+                : nil,
+            udpRelayMode: kind == .tuic ? query["udp_relay_mode"] ?? query["udp-relay-mode"] : nil,
+            portHopping: authorityPortHopping
+                ?? query["mport"]
+                ?? query["ports"]
+                ?? query["server-ports"]
+                ?? query["port-hopping"],
+            upMbps: kind == .hysteria ? mbps(query["upmbps"] ?? query["up"]) : nil,
+            downMbps: kind == .hysteria ? mbps(query["downmbps"] ?? query["down"]) : nil,
+            rawURI: raw,
+            vlessEncryption: kind == .vless ? vlessEncryption(query["encryption"]?.removingPercentEncoding) : nil
+        )
+    }
+
+    /// VLESS encryption other than `none`. Dropping it produced a node that
+    /// looked complete and could never handshake.
+    private func vlessEncryption(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty, value.lowercased() != "none" else { return nil }
+        return value
+    }
+
+    /// `scheme://auth@host:443,5000-6000/?…` → the link with its first port,
+    /// plus the full port list. Nil when the port is an ordinary number.
+    private func splitMultiPortAuthority(_ link: String) -> (link: String, ports: String)? {
+        guard let schemeEnd = link.range(of: "://") else { return nil }
+        let rest = link[schemeEnd.upperBound...]
+        let authorityEnd = rest.firstIndex(where: { "/?#".contains($0) }) ?? rest.endIndex
+        let authority = rest[..<authorityEnd]
+        let hostStart = authority.lastIndex(of: "@").map(authority.index(after:)) ?? authority.startIndex
+        let hostPort = authority[hostStart...]
+        let searchFrom = hostPort.lastIndex(of: "]") ?? hostPort.startIndex
+        guard let colon = hostPort[searchFrom...].lastIndex(of: ":") else { return nil }
+        let ports = String(hostPort[hostPort.index(after: colon)...])
+        guard ports.contains(where: { $0 == "," || $0 == "-" }),
+              ports.allSatisfy({ $0.isNumber || $0 == "," || $0 == "-" }),
+              let first = ports.split(whereSeparator: { $0 == "," || $0 == "-" }).first else { return nil }
+        let rebuilt = link[..<hostPort.index(after: colon)] + first + link[authorityEnd...]
+        return (String(rebuilt), ports)
+    }
+
+    /// Shadowrocket serializes Trojan WebSocket as a SIP003-looking plugin:
+    /// `plugin=obfs-local;obfs=websocket;obfs-host=…;obfs-uri=…`.
+    /// It is transport metadata, not Shadowsocks simple-obfs.
+    private func shadowrocketTrojanWebSocketOptions(
+        from plugin: String
+    ) -> (transport: String, host: String?, path: String?)? {
+        let parts = plugin.split(separator: ";", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard let name = parts.first?.lowercased(),
+              ["obfs", "obfs-local", "simple-obfs"].contains(name) else { return nil }
+
+        var mode: String?
+        var host: String?
+        var path: String?
+        for part in parts.dropFirst() {
+            let pair = part.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pair.count == 2 else { continue }
+            let key = pair[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let value = String(pair[1]).trimmingCharacters(in: .whitespaces)
+            switch key {
+            case "obfs", "mode": mode = value
+            case "obfs-host", "host": host = value
+            case "obfs-uri", "path": path = value
+            default: break
+            }
+        }
+        guard ["websocket", "ws", "wss"].contains(mode?.lowercased() ?? "") else {
+            return nil
+        }
+        return ("ws", host, path)
+    }
+
+    /// A deliberately bounded CONNECT-IP subset. Unknown fields reject the
+    /// node instead of silently discarding authentication or routing settings.
+    private func parseMASQUEClash(_ fields: [String: String], sourceID: UUID?) -> ProxyNode? {
+        let allowed: Set<String> = ["name", "type", "server", "port", "private-key", "public-key",
+                                    "ip", "ipv6", "network", "mtu", "dns", "remote-dns-resolve", "udp", "sni"]
+        guard Set(fields.keys).isSubset(of: allowed),
+              let server = fields["server"], let port = Int(fields["port"] ?? "") else { return nil }
+        if let value = fields["udp"], !["true", "false"].contains(value.lowercased()) { return nil }
+        if let value = fields["remote-dns-resolve"], !["true", "false"].contains(value.lowercased()) { return nil }
+        if let mtu = fields["mtu"], Int(mtu) == nil { return nil }
+        func validAddress(_ value: String, ipv6: Bool) -> Bool {
+            let parts = value.split(separator: "/", omittingEmptySubsequences: false)
+            guard parts.count <= 2 else { return false }
+            if parts.count == 2, !(Int(parts[1]).map { (0...(ipv6 ? 128 : 32)).contains($0) } ?? false) { return false }
+            return ipv6 ? IPv6Address(String(parts[0])) != nil : IPv4Address(String(parts[0])) != nil
+        }
+        if let ip = fields["ip"], !validAddress(ip, ipv6: false) { return nil }
+        if let ip = fields["ipv6"], !validAddress(ip, ipv6: true) { return nil }
+        let dns = fields["dns"].map { csvValues($0) }
+        if let dns, dns.contains(where: { IPv4Address($0) == nil && IPv6Address($0) == nil }) { return nil }
+        let options = MASQUEOptions(mode: .keyConnectIP, privateKey: fields["private-key"],
+            publicKey: fields["public-key"], ipv4: fields["ip"], ipv6: fields["ipv6"],
+            network: fields["network"], mtu: fields["mtu"].flatMap(Int.init), dns: dns,
+            remoteDNSResolve: fields["remote-dns-resolve"].map { $0.lowercased() == "true" })
+        let node = ProxyNode(sourceID: sourceID, kind: .masque, name: fields["name"] ?? server,
+            server: server, port: port, masque: options, tls: true, sni: fields["sni"],
+            udpRelayEnabled: fields["udp"].map { $0.lowercased() == "true" }, rawURI: "")
+        return node.hasSupportedMASQUEFields ? node : nil
+    }
+
+    private func parseMASQUEJSON(_ text: String, sourceID: UUID?) -> ParsedContent? {
+        guard let data = text.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        let records: [Any]
+        if let root = object as? [String: Any], let endpoints = root["endpoints"] as? [Any] {
+            // Count unhandled real outbounds too; never claim a full profile
+            // was imported when only its CONNECT-IP endpoints were retained.
+            records = endpoints + ((root["outbounds"] as? [[String: Any]]) ?? []).filter {
+                !["direct", "block", "dns", "selector", "urltest"].contains($0["type"] as? String ?? "")
+            }
+        } else if let root = object as? [String: Any], root["type"] as? String == "masque-client" {
+            records = [root]
+        } else if let array = object as? [[String: Any]], array.contains(where: { $0["type"] as? String == "masque-client" }) {
+            records = array
+        } else { return nil }
+        let nodes = records.compactMap { ($0 as? [String: Any]).flatMap { parseMASQUEEndpoint($0, sourceID: sourceID) } }
+        return .init(nodes: deduplicated(nodes), rejectedLineCount: records.count - nodes.count)
+    }
+
+    private func parseMASQUEEndpoint(_ fields: [String: Any], sourceID: UUID?) -> ProxyNode? {
+        let allowed: Set<String> = ["type", "tag", "server", "server_port", "username", "password", "path",
+                                   "headers", "version", "disable_version_fallback", "tls", "system", "mtu"]
+        guard fields["type"] as? String == "masque-client", Set(fields.keys).isSubset(of: allowed),
+              let server = fields["server"] as? String, let port = fields["server_port"] as? Int,
+              fields["system"] == nil || fields["system"] as? Bool == false else { return nil }
+        for key in ["tag", "username", "password", "path"] {
+            if fields[key] != nil && !(fields[key] is String) { return nil }
+        }
+        for key in ["version", "mtu"] {
+            if fields[key] != nil && !(fields[key] is Int) { return nil }
+        }
+        if fields["headers"] != nil && !(fields["headers"] is [String: String]) { return nil }
+        if fields["disable_version_fallback"] != nil && !(fields["disable_version_fallback"] is Bool) { return nil }
+        let tls = fields["tls"] as? [String: Any] ?? [:]
+        if fields["tls"] != nil && !(fields["tls"] is [String: Any]) { return nil }
+        guard Set(tls.keys).isSubset(of: ["enabled", "server_name", "insecure", "alpn", "certificate"]) else { return nil }
+        for key in ["enabled", "insecure"] { if tls[key] != nil && !(tls[key] is Bool) { return nil } }
+        if tls["server_name"] != nil && !(tls["server_name"] is String) { return nil }
+        func strings(_ value: Any?) -> [String]? {
+            if let string = value as? String { return [string] }
+            return value as? [String]
+        }
+        for key in ["alpn", "certificate"] { if tls[key] != nil && strings(tls[key]) == nil { return nil } }
+        let options = MASQUEOptions(mode: .basicConnectIP, mtu: fields["mtu"] as? Int,
+            httpVersion: fields["version"] as? Int, disableVersionFallback: fields["disable_version_fallback"] as? Bool,
+            headers: fields["headers"] as? [String: String], certificate: strings(tls["certificate"]))
+        let node = ProxyNode(sourceID: sourceID, kind: .masque, name: fields["tag"] as? String ?? server,
+            server: server, port: port, password: fields["password"] as? String, username: fields["username"] as? String,
+            masque: options, tls: tls["enabled"] as? Bool ?? false, sni: tls["server_name"] as? String,
+            path: fields["path"] as? String, alpn: strings(tls["alpn"])?.joined(separator: ","),
+            skipCertificateVerification: tls["insecure"] as? Bool ?? false, rawURI: "")
+        return node.hasSupportedMASQUEFields ? node : nil
+    }
+
+    private func parseClashYAML(_ text: String, sourceID: UUID?) -> ParsedContent {
+        let lines = text.components(separatedBy: .newlines)
+        guard let start = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "proxies:" }) else {
+            return .init(nodes: [], rejectedLineCount: 1)
+        }
+
+        var dictionaries: [[String: String]] = []
+        var current: [String: String] = [:]
+        var inside = false
+        // A proxy starts at the indentation of the first `-` under `proxies:`.
+        // Deeper `-` lines are a nested sequence — `http-opts: path: - /` is
+        // the common one — and treating those as a new proxy both invents a
+        // junk entry and truncates the real node at that line, dropping
+        // whatever follows. One real list loses 28 nodes' `reality-opts` that
+        // way: they import looking healthy and never connect.
+        var itemIndentation: Int?
+        // The key a bare sequence element belongs to, for the same reason.
+        var pendingSequenceKey: String?
+        var pluginIndentation: Int?
+        // A `key: |` block scalar — SSH private keys arrive this way. Without
+        // it the key's `-----BEGIN` line read as a list item and the node was
+        // torn apart.
+        var block: (key: String, keyIndentation: Int, folded: Bool, keepsNewline: Bool)?
+        var blockLines: [String] = []
+        var blockContentIndentation: Int?
+        func flushBlock() {
+            guard let open = block else { return }
+            var value = blockLines.joined(separator: open.folded ? " " : "\n")
+            if open.keepsNewline, !value.isEmpty { value += "\n" }
+            current[open.key] = value
+            block = nil
+            blockLines = []
+            blockContentIndentation = nil
+        }
+        func openBlock(_ key: String, _ value: String, keyIndentation: Int) -> Bool {
+            guard ["|", "|-", "|+", ">", ">-", ">+"].contains(value) else { return false }
+            block = (key, keyIndentation, value.hasPrefix(">"), !value.hasSuffix("-"))
+            return true
+        }
+
+        for rawLine in lines.dropFirst(start + 1) {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let indentation = rawLine.prefix { $0 == " " }.count
+            if block != nil {
+                if !trimmed.isEmpty, indentation > block!.keyIndentation {
+                    let contentIndentation = blockContentIndentation ?? indentation
+                    blockContentIndentation = contentIndentation
+                    blockLines.append(String(rawLine.dropFirst(min(contentIndentation, indentation)))
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\r")))
+                    continue
+                }
+                if trimmed.isEmpty { continue }
+                flushBlock()
+            }
+            if trimmed.isEmpty || trimmed.hasPrefix("#") { continue }
+            if indentation == 0 && !trimmed.hasPrefix("-") { break }
+
+            if trimmed.hasPrefix("-"), indentation <= (itemIndentation ?? indentation) {
+                itemIndentation = indentation
+                if !current.isEmpty { dictionaries.append(current) }
+                current = [:]
+                pluginIndentation = nil
+                inside = true
+                pendingSequenceKey = nil
+                let remainder = trimmed.dropFirst().trimmingCharacters(in: .whitespaces)
+                if remainder.hasPrefix("{") {
+                    current.merge(parseInlineYAMLMap(String(remainder))) { _, new in new }
+                } else if let pair = parseYAMLPair(String(remainder)) {
+                    current[pair.0] = pair.1
+                    if openBlock(pair.0, pair.1, keyIndentation: indentation + 2) { continue }
+                    if pair.1.isEmpty {
+                        pendingSequenceKey = pair.0
+                        if pair.0 == "plugin-opts" { pluginIndentation = indentation + 2 }
+                    }
+                }
+            } else if inside, trimmed.hasPrefix("-") {
+                // A nested element. Collected comma-joined so a multi-value
+                // `alpn` survives in the one form ProxyNode and the generators
+                // already use.
+                let element = yamlScalar(
+                    String(trimmed.dropFirst()).trimmingCharacters(in: .whitespaces)
+                )
+                guard !element.isEmpty else { continue }
+                // A single WireGuard peer begins with `- server: …`; that is a
+                // nested map entry, not a scalar belonging to `peers`.
+                if let pair = parseYAMLPair(element), !pair.1.isEmpty {
+                    if pair.0 == "server",
+                       current["type"]?.lowercased() == "wireguard" {
+                        let peerCount = Int(current["__wireguard-peer-count"] ?? "0") ?? 0
+                        current["__wireguard-peer-count"] = String(peerCount + 1)
+                    }
+                    current[pair.0] = pair.1
+                    pendingSequenceKey = nil
+                    continue
+                }
+                guard let key = pendingSequenceKey else { continue }
+                let existing = current[key] ?? ""
+                current[key] = existing.isEmpty ? element : existing + "," + element
+            } else if inside, let pair = parseYAMLPair(trimmed) {
+                if let parent = pluginIndentation, indentation > parent {
+                    current["plugin-opts." + pair.0] = pair.1
+                    continue
+                }
+                pluginIndentation = pair.0 == "plugin-opts" && pair.1.isEmpty ? indentation : nil
+                current[pair.0] = pair.1
+                pendingSequenceKey = pair.1.isEmpty ? pair.0 : nil
+                if openBlock(pair.0, pair.1, keyIndentation: indentation) { pendingSequenceKey = nil }
+            }
+        }
+        flushBlock()
+        if !current.isEmpty { dictionaries.append(current) }
+
+        var nodes: [ProxyNode] = []
+        var rejected = 0
+        for rawDictionary in dictionaries {
+            let dictionary = flattenedClashProxy(rawDictionary)
+            if dictionary["type"]?.lowercased() == "masque" {
+                if let node = parseMASQUEClash(dictionary, sourceID: sourceID) { nodes.append(node) }
+                else { rejected += 1 }
+                continue
+            }
+            guard let type = dictionary["type"]?.lowercased(),
+                  let kind = clashKind(type),
+                  let rawServer = dictionary["server"],
+                  let port = Int(dictionary["port"] ?? "") else {
+                rejected += 1
+                continue
+            }
+            // ProxyNode intentionally models one WireGuard endpoint. Flattening
+            // multiple peers would silently keep only the final peer and can
+            // route traffic to the wrong endpoint, so preserve integrity by
+            // rejecting that one proxy instead.
+            if kind == .wireguard,
+               (Int(dictionary["__wireguard-peer-count"] ?? "0") ?? 0) > 1 {
+                rejected += 1
+                continue
+            }
+            // AmneziaWG changes the handshake; as plain WireGuard the node
+            // would import cleanly and never connect.
+            if kind == .wireguard, dictionary.keys.contains(where: Self.isAmneziaWireGuardKey) {
+                rejected += 1
+                continue
+            }
+            if normalizedTransport(dictionary["network"]) == "xhttp", !clashXHTTPOptionsAreExpressible(rawDictionary) {
+                rejected += 1
+                continue
+            }
+            if kind == .snell, !Self.snellModeIsDefault(dictionary["mode"]) {
+                rejected += 1
+                continue
+            }
+            // SSH needs a login and a password or an inline key. Mihomo also
+            // accepts a key *file path*, which no other device can read.
+            if kind == .ssh {
+                let user = dictionary["username"] ?? dictionary["user"] ?? ""
+                let key = dictionary["private-key"] ?? ""
+                let keyIsInline = key.contains("PRIVATE KEY")
+                guard !user.isEmpty, (!(dictionary["password"] ?? "").isEmpty || keyIsInline),
+                      key.isEmpty || keyIsInline else {
+                    rejected += 1
+                    continue
+                }
+            }
+            if kind == .trustTunnel,
+               (dictionary["username"] ?? "").isEmpty || (dictionary["password"] ?? "").isEmpty {
+                rejected += 1
+                continue
+            }
+
+            // Keep the plugin and its independent credentials. Unsupported
+            // plugins are rejected instead of being flattened into plain SS.
+            var obfsMode = dictionary["obfs"]
+            var sip003Plugin: String?
+            var pluginTransport: String?
+            var pluginPath: String?
+            var pluginTLS = false
+            var pluginMux: Bool?
+            var shadowTLS: ShadowTLSOptions?
+            // `obfs-param` is ShadowsocksR's key. Hysteria 2 spells the same
+            // slot `obfs-password`, and reading only the SSR name left every
+            // salamander node with a type and no password — which makes Mihomo
+            // reject the whole profile, not just that node.
+            var obfsHost = dictionary["obfs-param"]
+                ?? dictionary["obfs-password"]
+                ?? dictionary["obfs_password"]
+            // mihomo nests Snell obfuscation under `obfs-opts`; dropping it
+            // imported a node that looked fine and could not connect.
+            if kind == .snell {
+                var options = parseInlineYAMLMap(dictionary["obfs-opts"] ?? "")
+                for (key, value) in dictionary where key.hasPrefix("obfs-opts.") {
+                    options[String(key.dropFirst("obfs-opts.".count))] = value
+                }
+                if let mode = options["mode"], !mode.isEmpty {
+                    obfsMode = mode
+                    obfsHost = options["host"]
+                }
+            }
+            if kind == .shadowsocks, let plugin = dictionary["plugin"]?.lowercased(), !plugin.isEmpty {
+                var options = parseInlineYAMLMap(dictionary["plugin-opts"] ?? "")
+                for (key, value) in dictionary where key.hasPrefix("plugin-opts.") {
+                    options[String(key.dropFirst("plugin-opts.".count))] = value
+                }
+                if plugin == "shadow-tls" {
+                    // UDP-over-TCP is a separate server capability. Reject an
+                    // enabled, unmodelled mode rather than silently losing it.
+                    guard !boolString(dictionary["udp-over-tcp"]),
+                          let parsed = shadowTLSOptions(options) else {
+                        rejected += 1
+                        continue
+                    }
+                    sip003Plugin = "shadow-tls"
+                    shadowTLS = parsed
+                } else if plugin == "obfs" || plugin == "obfs-local" || plugin == "simple-obfs" {
+                    obfsMode = options["mode"] ?? "http"
+                    obfsHost = options["host"]
+                } else if plugin == "v2ray-plugin",
+                          ["websocket", "ws"].contains((options["mode"] ?? "websocket").lowercased()) {
+                    sip003Plugin = "v2ray-plugin"
+                    pluginTransport = "ws"
+                    pluginPath = options["path"]
+                    pluginTLS = boolString(options["tls"])
+                    pluginMux = options["mux"].map { boolString($0) }
+                    obfsHost = options["host"]
+                } else {
+                    rejected += 1
+                    continue
+                }
+            }
+
+            let server = normalizedHost(rawServer)
+            // The deliberately small YAML reader above flattens nested maps.
+            // Keep the parent marker so a generic `public-key` is only treated
+            // as REALITY when it actually came from `reality-opts`.
+            let hasRealityOptions = dictionary.keys.contains("reality-opts")
+                || dictionary["security"]?.lowercased() == "reality"
+            nodes.append(ProxyNode(
+                sourceID: sourceID,
+                kind: kind,
+                name: normalizedName(dictionary["name"], fallback: server),
+                server: server,
+                port: port,
+                cipher: dictionary["cipher"],
+                // Hysteria 1 calls it `auth-str` and Snell calls it `psk`;
+                // both are the single shared secret ProxyNode stores.
+                password: dictionary["password"]
+                    ?? dictionary["auth-str"]
+                    ?? dictionary["auth_str"]
+                    ?? dictionary["auth"]
+                    ?? dictionary["psk"],
+                uuid: dictionary["uuid"],
+                // Stash spells the SSH login `user`.
+                username: dictionary["username"] ?? (kind == .ssh ? dictionary["user"] : nil),
+                transport: pluginTransport ?? normalizedTransport(dictionary["network"]),
+                transportMode: normalizedTransport(dictionary["network"]) == "xhttp"
+                    ? dictionary["mode"] : nil,
+                plugin: sip003Plugin,
+                pluginMux: pluginMux,
+                shadowTLS: shadowTLS,
+                // TLS is part of the Trojan protocol itself. Mihomo therefore
+                // omits the redundant `tls: true` field in valid Trojan nodes;
+                // treating that omission as plaintext breaks every strict
+                // target format derived from this shared model.
+                tls: kind == .trojan || kind == .trustTunnel || pluginTLS || boolString(dictionary["tls"]),
+                sni: dictionary["servername"] ?? dictionary["sni"],
+                hostHeader: sip003Plugin == "v2ray-plugin" ? obfsHost : dictionary["authority"] ?? dictionary["host"],
+                path: pluginPath
+                    ?? (normalizedTransport(dictionary["network"]) == "grpc"
+                        ? dictionary["grpc-service-name"] ?? dictionary["service-name"] ?? dictionary["path"]
+                        : dictionary["path"]),
+                alpn: ALPNList.normalized(dictionary["alpn"]),
+                realityPublicKey: hasRealityOptions
+                    ? dictionary["public-key"] ?? dictionary["pbk"]
+                    : nil,
+                realityShortID: hasRealityOptions
+                    ? clashYAMLScalar(dictionary["short-id"] ?? dictionary["sid"])
+                    : nil,
+                certificateFingerprint: dictionary["server-cert-fingerprint"]
+                    ?? dictionary["tls-fingerprint"]
+                    ?? dictionary["fingerprint"],
+                fingerprint: dictionary["client-fingerprint"]
+                    ?? dictionary["fp"],
+                flow: dictionary["flow"],
+                skipCertificateVerification: boolString(dictionary["skip-cert-verify"]),
+                alterID: Int(dictionary["alterid"] ?? dictionary["alter-id"] ?? ""),
+                protocolName: dictionary["protocol"],
+                protocolParam: dictionary["protocol-param"],
+                obfs: obfsMode,
+                obfsParam: sip003Plugin == nil ? obfsHost : nil,
+                version: Int(dictionary["version"] ?? ""),
+                congestionControl: dictionary["congestion-controller"]
+                    ?? dictionary["congestion_control"],
+                udpRelayMode: dictionary["udp-relay-mode"],
+                udpRelayEnabled: [.shadowsocks, .trustTunnel].contains(kind) ? dictionary["udp"].map { boolString($0) } : nil,
+                portHopping: dictionary["ports"]
+                    ?? dictionary["mport"]
+                    ?? dictionary["server-ports"]
+                    ?? dictionary["port-hopping"],
+                upMbps: kind == .hysteria ? mbps(dictionary["up"] ?? dictionary["up-speed"]) : nil,
+                downMbps: kind == .hysteria ? mbps(dictionary["down"] ?? dictionary["down-speed"]) : nil,
+                wireGuardPrivateKey: kind == .wireguard ? dictionary["private-key"] : nil,
+                wireGuardPublicKey: kind == .wireguard ? dictionary["public-key"] : nil,
+                wireGuardPreSharedKey: kind == .wireguard
+                    ? dictionary["pre-shared-key"] ?? dictionary["preshared-key"]
+                    : nil,
+                wireGuardIPv4: kind == .wireguard ? dictionary["ip"] : nil,
+                wireGuardIPv6: kind == .wireguard ? dictionary["ipv6"] : nil,
+                wireGuardAllowedIPs: kind == .wireguard
+                    ? csvValues(dictionary["allowed-ips"] ?? "0.0.0.0/0,::/0").joined(separator: ",")
+                    : nil,
+                wireGuardReserved: kind == .wireguard
+                    ? csvValues(dictionary["reserved"] ?? "").joined(separator: ",")
+                    : nil,
+                wireGuardMTU: kind == .wireguard ? Int(dictionary["mtu"] ?? "") : nil,
+                wireGuardPersistentKeepalive: kind == .wireguard
+                    ? Int(dictionary["persistent-keepalive"] ?? dictionary["keepalive"] ?? "")
+                    : nil,
+                wireGuardDNS: kind == .wireguard
+                    ? csvValues(dictionary["dns"] ?? "").joined(separator: ",")
+                    : nil,
+                rawURI: "clash://local/\(UUID().uuidString)",
+                vlessEncryption: kind == .vless ? vlessEncryption(dictionary["encryption"]) : nil,
+                ssh: kind == .ssh ? SSHOptions(
+                    privateKey: dictionary["private-key"].flatMap { $0.isEmpty ? nil : $0 },
+                    privateKeyPassphrase: dictionary["private-key-passphrase"].flatMap { $0.isEmpty ? nil : $0 },
+                    hostKeys: csvValues(dictionary["host-key"] ?? ""),
+                    hostKeyAlgorithms: csvValues(dictionary["host-key-algorithms"] ?? "")
+                ) : nil,
+                trustTunnel: kind == .trustTunnel ? TrustTunnelOptions(quic: boolString(dictionary["quic"])) : nil
+            ))
+        }
+        return .init(
+            nodes: nodes,
+            rejectedLineCount: dictionaries.isEmpty ? 1 : rejected
+        )
+    }
+
+    /// Clash producers occasionally encode a single REALITY short id as a
+    /// one-element YAML array. ProxyNode stores the protocol value itself.
+    private func clashYAMLScalar(_ value: String?) -> String? {
+        guard var value else { return nil }
+        value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.hasPrefix("["), value.hasSuffix("]") {
+            value = String(value.dropFirst().dropLast())
+                .split(separator: ",", maxSplits: 1)
+                .first
+                .map(String.init) ?? ""
+        }
+        value = value.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n\"'"))
+        return value.isEmpty ? nil : value
+    }
+
+    private func parseInlineYAMLMap(_ value: String) -> [String: String] {
+        // Sub-Store's Shadowrocket producer writes each proxy as a JSON object
+        // under `proxies:`. JSON is valid inline YAML, but its quoted keys and
+        // escaped strings must be decoded as JSON first: the small YAML reader
+        // below deliberately does not implement JSON string escaping.
+        if let json = parseInlineJSONMap(value) { return json }
+
+        let body = value.trimmingCharacters(in: CharacterSet(charactersIn: "{} "))
+        var pieces: [String] = []
+        var current = ""
+        var quote: Character?
+        var depth = 0
+        for character in body {
+            if character == "\"" || character == "'" {
+                if quote == character { quote = nil }
+                else if quote == nil { quote = character }
+            } else if quote == nil {
+                if "[{".contains(character) { depth += 1 }
+                if "]}".contains(character) { depth -= 1 }
+                if character == "," && depth == 0 {
+                    pieces.append(current)
+                    current = ""
+                    continue
+                }
+            }
+            current.append(character)
+        }
+        if !current.isEmpty { pieces.append(current) }
+        return Dictionary(pieces.compactMap(parseYAMLPair)) { _, new in new }
+    }
+
+    private func parseInlineJSONMap(_ value: String) -> [String: String]? {
+        guard let data = value.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else { return nil }
+
+        return dictionary.reduce(into: [:]) { result, entry in
+            guard let value = inlineJSONValue(entry.value) else { return }
+            result[entry.key.lowercased()] = value
+        }
+    }
+
+    private func inlineJSONValue(_ value: Any) -> String? {
+        if let string = value as? String { return string }
+        if value is NSNull { return nil }
+        if let number = value as? NSNumber { return number.stringValue }
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+              let string = String(data: data, encoding: .utf8) else { return nil }
+        return string
+    }
+
+    /// Inline Clash proxies can contain nested inline maps, for example
+    /// `reality-opts: {public-key: ..., short-id: ...}` and
+    /// `ws-opts: {path: /ws, headers: {Host: example.com}}`. The small YAML
+    /// reader intentionally represents a proxy as `[String: String]`, so make
+    /// those protocol-bearing fields explicit before constructing ProxyNode.
+    /// Without this step a REALITY node silently becomes ordinary TLS and a
+    /// WebSocket node loses its path/Host while still appearing importable.
+    private func flattenedClashProxy(_ source: [String: String]) -> [String: String] {
+        var result = source
+
+        if let rawReality = source["reality-opts"] {
+            let reality = parseInlineYAMLMap(rawReality)
+            if result["public-key"] == nil { result["public-key"] = reality["public-key"] }
+            if result["short-id"] == nil { result["short-id"] = reality["short-id"] }
+        }
+
+        let transportOptionKeys = [
+            "ws-opts", "http-opts", "h2-opts", "http-upgrade-opts", "xhttp-opts"
+        ]
+        for optionKey in transportOptionKeys {
+            guard let rawOptions = source[optionKey] else { continue }
+            let options = parseInlineYAMLMap(rawOptions)
+            if result["path"] == nil { result["path"] = options["path"] }
+            if result["host"] == nil { result["host"] = options["host"] }
+            if result["mode"] == nil { result["mode"] = options["mode"] }
+            if result["host"] == nil, let rawHeaders = options["headers"] {
+                let headers = parseInlineYAMLMap(rawHeaders)
+                result["host"] = headers["host"]
+            }
+        }
+
+        if let rawGRPC = source["grpc-opts"] {
+            let options = parseInlineYAMLMap(rawGRPC)
+            if result["grpc-service-name"] == nil {
+                result["grpc-service-name"] = options["grpc-service-name"]
+                    ?? options["service-name"]
+            }
+        }
+        // HTTP camouflage accepts a list of alternative request paths/Hosts.
+        // ProxyNode represents one request; retain one valid choice, not the
+        // YAML array spelling (which becomes a different HTTP header/path).
+        if normalizedTransport(result["network"]) == "http" {
+            result["path"] = clashYAMLScalar(result["path"])
+            result["host"] = clashYAMLScalar(result["host"])
+        }
+        return result
+    }
+
+    private func parseYAMLPair(_ value: String) -> (String, String)? {
+        guard let separator = value.firstIndex(of: ":") else { return nil }
+        let key = value[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = value[value.index(after: separator)...].trimmingCharacters(in: .whitespacesAndNewlines)
+        // Unquoted YAML nulls are absent values, not the string "null".
+        // Check before unquoting so literal credentials such as 'null' survive.
+        guard !key.isEmpty, !["null", "Null", "NULL", "~"].contains(raw) else { return nil }
+        return (key.lowercased(), yamlScalar(raw))
+    }
+
+    /// Unwraps a YAML scalar, decoding escapes when the quoting style has them.
+    ///
+    /// Panels that emit YAML from a serialiser rather than by hand write
+    /// non-ASCII as escapes: one airport sends every node as
+    /// `name: "\U0001F1ED\U0001F1F0 香港 01"`. Stripping the quotes without
+    /// decoding leaves the escape text itself as the node name, which is what
+    /// the list then displays and what every generated configuration carries.
+    ///
+    /// Only double quotes process escapes. In a single-quoted scalar a
+    /// backslash is a literal backslash and `''` is the only escape there is,
+    /// so the two styles cannot share one code path.
+    private func yamlScalar(_ raw: String) -> String {
+        guard raw.count >= 2 else {
+            return raw.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        }
+        if raw.hasPrefix("'"), raw.hasSuffix("'") {
+            return String(raw.dropFirst().dropLast()).replacingOccurrences(of: "''", with: "'")
+        }
+        guard raw.hasPrefix("\""), raw.hasSuffix("\"") else {
+            return raw.trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        }
+        return decodeYAMLEscapes(String(raw.dropFirst().dropLast()))
+    }
+
+    private func decodeYAMLEscapes(_ body: String) -> String {
+        guard body.contains("\\") else { return body }
+        var output = ""
+        let scalars = Array(body.unicodeScalars)
+        var index = 0
+        // A `\uD83C\uDDED` pair has to be combined before it can be appended;
+        // appending a lone surrogate is not representable in a Swift string.
+        var pendingHighSurrogate: UInt32?
+
+        func flushSurrogate() {
+            if let high = pendingHighSurrogate, let scalar = Unicode.Scalar(high) {
+                output.unicodeScalars.append(scalar)
+            }
+            pendingHighSurrogate = nil
+        }
+
+        func hex(_ count: Int) -> UInt32? {
+            guard index + count <= scalars.count else { return nil }
+            let digits = String(String.UnicodeScalarView(scalars[index ..< index + count]))
+            guard digits.count == count, let value = UInt32(digits, radix: 16) else { return nil }
+            index += count
+            return value
+        }
+
+        while index < scalars.count {
+            let scalar = scalars[index]
+            guard scalar == "\\", index + 1 < scalars.count else {
+                flushSurrogate()
+                output.unicodeScalars.append(scalar)
+                index += 1
+                continue
+            }
+            let marker = scalars[index + 1]
+            index += 2
+
+            let width: Int
+            switch marker {
+            case "x": width = 2
+            case "u": width = 4
+            case "U": width = 8
+            default:
+                flushSurrogate()
+                switch marker {
+                case "n": output.append("\n")
+                case "t": output.append("\t")
+                case "r": output.append("\r")
+                case "0": output.append("\0")
+                case "a": output.unicodeScalars.append(Unicode.Scalar(7))
+                case "b": output.unicodeScalars.append(Unicode.Scalar(8))
+                case "e": output.unicodeScalars.append(Unicode.Scalar(27))
+                // `\/` and `\_` are YAML's, `\\` and `\"` are shared with JSON.
+                default: output.unicodeScalars.append(marker)
+                }
+                continue
+            }
+
+            guard let value = hex(width) else {
+                flushSurrogate()
+                output.append("\\")
+                output.unicodeScalars.append(marker)
+                continue
+            }
+            if let high = pendingHighSurrogate {
+                pendingHighSurrogate = nil
+                if (0xDC00 ... 0xDFFF).contains(value) {
+                    let combined = 0x10000 + ((high - 0xD800) << 10) + (value - 0xDC00)
+                    if let scalar = Unicode.Scalar(combined) { output.unicodeScalars.append(scalar) }
+                    continue
+                }
+                if let scalar = Unicode.Scalar(high) { output.unicodeScalars.append(scalar) }
+            }
+            if (0xD800 ... 0xDBFF).contains(value) {
+                pendingHighSurrogate = value
+            } else if let decoded = Unicode.Scalar(value) {
+                output.unicodeScalars.append(decoded)
+            }
+        }
+        flushSurrogate()
+        return output
+    }
+
+    /// Keys that only AmneziaWG carries: mihomo's `amnezia-wg-option` block
+    /// and its junk-packet / header parameters.
+    static func isAmneziaWireGuardKey(_ key: String) -> Bool {
+        let key = key.lowercased()
+        return key.hasPrefix("amnezia-wg-option")
+            || ["jc", "jmin", "jmax", "s1", "s2", "h1", "h2", "h3", "h4"].contains(key)
+    }
+
+    private func clashKind(_ value: String) -> ProxyKind? {
+        switch value {
+        case "ss": .shadowsocks
+        case "ssr": .shadowsocksR
+        case "vmess": .vmess
+        case "vless": .vless
+        case "trojan": .trojan
+        case "hysteria2", "hy2": .hysteria2
+        case "hysteria": .hysteria
+        case "tuic": .tuic
+        case "wireguard", "wg": .wireguard
+        case "anytls": .anytls
+        case "snell": .snell
+        case "socks5", "socks": .socks5
+        case "http", "https": .http
+        case "ssh": .ssh
+        case "trusttunnel", "trust-tunnel": .trustTunnel
+        default: nil
+        }
+    }
+
+    private func parseEndpoint(_ value: String) -> (host: String, port: Int)? {
+        guard let components = URLComponents(string: "tcp://\(value)"),
+              let host = components.host,
+              let port = components.port else { return nil }
+        return (normalizedHost(host), port)
+    }
+
+    /// `URLComponents.host` keeps the brackets around an IPv6 literal. Storing
+    /// them would break `inet_pton` in the offline country database, the
+    /// `getaddrinfo` latency probe, and the generated Clash `server` field, so
+    /// the address is kept bare and re-bracketed only where a format needs it.
+    private func normalizedHost(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("["), trimmed.hasSuffix("]"), trimmed.count > 2 else {
+            return trimmed
+        }
+        return String(trimmed.dropFirst().dropLast())
+    }
+
+    // A malformed or simply repetitive query string can repeat a key. Keeping
+    // the last occurrence matches how the clients read these links; the
+    // uniquing initialiser would trap instead.
+    private func queryDictionary(_ query: String) -> [String: String] {
+        Dictionary(
+            query.split(separator: "&").compactMap { item in
+                let pair = item.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+                guard pair.count == 2 else { return nil }
+                return (String(pair[0]), String(pair[1]))
+            },
+            uniquingKeysWith: { _, new in new }
+        )
+    }
+
+    /// Shadowrocket's endpoint-only VLESS/VMess dialect calls the WebSocket header
+    /// `obfsParam`. Most producers store a bare hostname there, while others
+    /// percent-encode a JSON header map such as `{\"Host\":\"cdn.example\"}`.
+    /// Decode both shapes without ever serialising the JSON object itself as a
+    /// Host value.
+    private func webSocketHost(from rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let decoded = rawValue.removingPercentEncoding ?? rawValue
+        let candidate = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return nil }
+        guard candidate.hasPrefix("{") else { return candidate }
+        guard let data = candidate.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return nil
+        }
+
+        func hostValue(in headers: [String: Any]) -> String? {
+            for (key, value) in headers where key.caseInsensitiveCompare("host") == .orderedSame {
+                if let string = value as? String {
+                    let host = string.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return host.isEmpty ? nil : host
+                }
+                if let values = value as? [String],
+                   let first = values.first(where: {
+                       !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                   }) {
+                    return first.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            return nil
+        }
+
+        if let host = hostValue(in: dictionary) { return host }
+        for (key, value) in dictionary where key.caseInsensitiveCompare("headers") == .orderedSame {
+            if let headers = value as? [String: Any] {
+                return hostValue(in: headers)
+            }
+        }
+        return nil
+    }
+
+    /// HTTP(S) share links exist in two naming dialects. Standard URLs keep a
+    /// plain name in the fragment, while Shadowrocket-compatible producers can
+    /// put a URL-safe Base64 name in `remarks`. Decode only canonical Base64
+    /// UTF-8 so an ordinary plain-text remark is never turned into binary
+    /// garbage by Foundation's permissive Base64 decoder.
+    private func proxyNameQueryValue(_ query: [String: String]) -> String? {
+        for key in ["remarks", "remark", "name", "ps", "tag"] {
+            if let value = decodedProxyName(query[key], mayBeBase64: true) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    private func decodedProxyName(_ value: String?, mayBeBase64: Bool) -> String? {
+        guard let value else { return nil }
+        let decoded = value.removingPercentEncoding ?? value
+        let trimmed = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard mayBeBase64,
+              !trimmed.contains(where: { $0.isWhitespace }),
+              trimmed.unicodeScalars.allSatisfy({
+                  CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_=")
+                      .contains($0)
+              }) else {
+            return trimmed
+        }
+
+        let source = trimmed
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        var padded = source
+        let remainder = padded.count % 4
+        if remainder != 0 { padded.append(String(repeating: "=", count: 4 - remainder)) }
+        guard let data = Data(base64Encoded: padded),
+              let decodedName = String(data: data, encoding: .utf8) else {
+            return trimmed
+        }
+        let canonicalSource = source.trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        let canonicalRoundTrip = data.base64EncodedString()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+        guard canonicalRoundTrip == canonicalSource,
+              decodedName.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+            return trimmed
+        }
+        let name = decodedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? trimmed : name
+    }
+
+    private func containsNodeScheme(_ value: String) -> Bool {
+        let lowercased = value.lowercased()
+        return [
+            "ss://", "ssr://", "vmess://", "vless://", "trojan://",
+            "hysteria2://", "hy2://", "hysteria://", "tuic://", "wireguard://", "wg://",
+            "anytls://", "socks5://", "socks://", "http://", "https://"
+        ]
+            .contains(where: lowercased.contains)
+    }
+
+    /// Normalises YAML/URI list scalars (`[a, b]`, `a,b`) without touching
+    /// colons inside IPv6 addresses.
+    private func csvValues(_ value: String) -> [String] {
+        value.trimmingCharacters(in: CharacterSet(charactersIn: "[] \t\r\n\"'"))
+            .split(separator: ",", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n\"'")) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func decodeBase64String(_ value: String) -> String? {
+        var normalized = value
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .joined()
+        let remainder = normalized.count % 4
+        if remainder != 0 { normalized.append(String(repeating: "=", count: 4 - remainder)) }
+        guard let data = Data(base64Encoded: normalized, options: .ignoreUnknownCharacters) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func normalizedName(_ value: String?, fallback: String) -> String {
+        // Share links encode the name form-style, so `+` is a space. Strictly a
+        // URI fragment keeps `+` literal, but every airport writes it the other
+        // way — this one publishes "🇭🇰+HongKong+01" and its own Shadowrocket
+        // link spells the same node "🇭🇰%20HongKong%2001".
+        let spaced = (value ?? "").replacingOccurrences(of: "+", with: " ")
+        let trimmed = spaced.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
+    private func stringValue(_ value: Any?) -> String? {
+        if let value = value as? String { return value }
+        if let value = value as? NSNumber { return value.stringValue }
+        return nil
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int { return value }
+        if let value = value as? NSNumber { return value.intValue }
+        if let value = value as? String { return Int(value) }
+        return nil
+    }
+
+    private func boolValue(_ value: Any?) -> Bool {
+        if let value = value as? Bool { return value }
+        if let value = value as? NSNumber { return value.boolValue }
+        if let value = value as? String { return boolString(value) }
+        return false
+    }
+
+    private func boolString(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return ["true", "1", "yes", "tls"].contains(value.lowercased())
+    }
+
+    /// Reads a Hysteria 1 bandwidth field.
+    ///
+    /// Airports write these as a bare number, as `100 Mbps`, and occasionally
+    /// as `100mbps`, so the digits are taken and the unit ignored. Zero and
+    /// negative values mean "unset" rather than "no bandwidth".
+    private func mbps(_ value: String?) -> Int? {
+        guard let value else { return nil }
+        let digits = value.prefix { $0.isNumber }
+        guard let number = Int(digits), number > 0 else { return nil }
+        return number
+    }
+
+    private func deduplicated(_ nodes: [ProxyNode]) -> [ProxyNode] {
+        var seen = Set<String>()
+        return nodes.filter { node in
+            let key = node.isSubscriptionMetadata == true
+                ? "\(node.canonicalKey)|metadata|\(node.name.lowercased())"
+                : node.canonicalKey
+            return seen.insert(key).inserted
+        }
+    }
+
+    /// Some subscription edges return only a flag as the remark even though
+    /// another edge returns the full regional name. Two `🇭🇰` entries are
+    /// impossible to distinguish in policy groups and exported profiles, so
+    /// recover the provider's numeric hint from hosts such as `hk2` / `hk3`.
+    /// A stable sequence is used only when that hint is absent. Provider names
+    /// containing any real text are never rewritten.
+    private func restoringAmbiguousRegionalNames(_ nodes: [ProxyNode]) -> [ProxyNode] {
+        var indexesByCountryCode: [String: [Int]] = [:]
+        for (index, node) in nodes.enumerated() {
+            guard let code = bareFlagCountryCode(in: node.name) else { continue }
+            indexesByCountryCode[code, default: []].append(index)
+        }
+
+        var restored = nodes
+        for (code, indexes) in indexesByCountryCode where indexes.count > 1 {
+            guard let region = NodeRegionResolver.region(countryCode: code) else { continue }
+            var usedSuffixes = Set<Int>()
+            var nextFallback = 1
+
+            for index in indexes {
+                let hinted = regionalNumberHint(in: nodes[index].server, countryCode: code)
+                let number: Int
+                if let hinted, usedSuffixes.insert(hinted).inserted {
+                    number = hinted
+                } else {
+                    while usedSuffixes.contains(nextFallback) { nextFallback += 1 }
+                    number = nextFallback
+                    usedSuffixes.insert(number)
+                    nextFallback += 1
+                }
+                restored[index].name = "\(region.flag) \(region.name)\(String(format: "%02d", number))"
+            }
+        }
+        return restored
+    }
+
+    private func bareFlagCountryCode(in name: String) -> String? {
+        guard let code = NodeRegionResolver.flaggedCountryCode(in: name) else { return nil }
+        let remainder = name.unicodeScalars
+            .filter { !(0x1F1E6...0x1F1FF).contains(Int($0.value)) }
+            .map(String.init)
+            .joined()
+            .trimmingCharacters(
+                in: CharacterSet.whitespacesAndNewlines.union(
+                    CharacterSet(charactersIn: "-_|·•")
+                )
+            )
+        return remainder.isEmpty ? code : nil
+    }
+
+    private func regionalNumberHint(in server: String, countryCode: String) -> Int? {
+        let code = countryCode.lowercased()
+        let tokens = server.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        for token in tokens where token.hasPrefix(code) {
+            let digits = token.dropFirst(code.count)
+            guard !digits.isEmpty, digits.count <= 3,
+                  digits.allSatisfy(\.isNumber),
+                  let number = Int(digits), number > 0 else { continue }
+            return number
+        }
+        return nil
+    }
+
+    private func markingSubscriptionMetadata(_ node: ProxyNode) -> ProxyNode {
+        var marked = node
+        marked.isSubscriptionMetadata = Self.isNotice(node)
+        return marked
+    }
+}

@@ -1,0 +1,2382 @@
+import SwiftUI
+import UIKit
+
+struct RulesView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var isImportPresented = false
+    @State private var pendingDeletion: RuleScheme?
+    @State private var editingImportedScheme: RuleScheme?
+    @State private var customizationScheme: RuleScheme?
+    @State private var selfConfigurationError: String?
+
+    var body: some View {
+        ScrollView {
+            // A plain stack, not lazy: an expanded built-in scheme grows by
+            // dozens of policy rows, and a LazyVStack kept re-estimating the
+            // off-screen cards against it while scrolling. A Mac user hung
+            // for ten seconds scrolling past an expanded 全分组. There are
+            // only a dozen or so cards, so measuring all of them is cheap.
+            VStack(spacing: 12) {
+                // No summary card above the list: it repeated the selected
+                // scheme, which the list itself already marks.
+                builtInSection
+                importedSchemesSection
+
+                Button {
+                    model.selectedTab = .export
+                } label: {
+                    PrimaryActionLabel(title: "继续选择客户端", symbol: "arrow.right", isProminent: false)
+                }
+                .buttonStyle(ResponsivePressButtonStyle())
+                .disabled(!model.hasExportableSources)
+                .accessibilityIdentifier("continue-to-export")
+            }
+            .frame(maxWidth: TowerPlatform.isMac ? TowerTheme.macContentMaxWidth : .infinity)
+            .padding(.horizontal, TowerPlatform.isMac ? 28 : TowerTheme.pagePadding)
+            .frame(maxWidth: .infinity)
+            .padding(.top, 12)
+            .padding(.bottom, 34)
+        }
+        .background(TowerTheme.background.ignoresSafeArea())
+        .navigationTitle("分流规则")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    isImportPresented = true
+                } label: {
+                    Label("导入规则", systemImage: "link")
+                }
+                .accessibilityIdentifier("import-rule-scheme")
+            }
+        }
+        .sheet(isPresented: $isImportPresented) {
+            ImportRuleSchemeSheet()
+        }
+        .sheet(item: $customizationScheme) { scheme in
+            RuleCustomizationSheet(scheme: scheme)
+        }
+        .sheet(item: $editingImportedScheme) { scheme in
+            ImportedRuleSchemeEditor(scheme: scheme)
+        }
+        .alert(
+            pendingDeletion.map { String(localized: "删除“\($0.name)”？") } ?? String(localized: "确认删除"),
+            isPresented: Binding(
+                get: { pendingDeletion != nil },
+                set: { if !$0 { pendingDeletion = nil } }
+            ),
+            presenting: pendingDeletion
+        ) { deletion in
+            Button("删除", role: .destructive) {
+                withAnimation(TowerMotion.disclosure(reduceMotion: reduceMotion)) {
+                    model.deleteScheme(deletion)
+                }
+                pendingDeletion = nil
+            }
+            Button("取消", role: .cancel) { pendingDeletion = nil }
+        } message: { _ in
+            Text("这个规则方案和它下载的规则列表会从这台设备移除。")
+        }
+    }
+
+    private var builtInSection: some View {
+        let schemes = model.ruleSchemes.filter(\.isBundled)
+        return Group {
+            SectionHeading(title: "本机规则", detail: String(localized: "安装后离线可用"))
+            Label("点击规则方案即可修改规则", systemImage: "hand.tap")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 4)
+                .padding(.top, -4)
+                .accessibilityIdentifier("rules-editing-hint")
+            ForEach(schemes) { scheme in
+                // The bundled lists are always here, but rules the user added
+                // can arrive through iCloud without their downloads. Export
+                // refuses such a scheme, so the card has to say so and offer
+                // the refresh; `refreshScheme` fetches only those additions.
+                let isReady = model.rulesPageSummaries[scheme.id]?.isReady ?? true
+                RuleSchemeCard(
+                    scheme: scheme,
+                    previewScheme: model.rulesPageSummaries[scheme.id]?.preview ?? scheme,
+                    isSelected: model.selectedPresetID == scheme.id,
+                    ruleCount: model.rulesPageSummaries[scheme.id]?.count,
+                    isRefreshing: model.importingSchemeIDs.contains(scheme.id),
+                    isReady: isReady,
+                    onCustomize: { customizationScheme = scheme },
+                    onSelect: { model.selectScheme(scheme) },
+                    onRefresh: isReady ? nil : { Task { await model.refreshScheme(scheme) } },
+                    onEdit: nil,
+                    onDelete: nil
+                )
+            }
+            if let selfConfigurationScheme = model.selfConfigurationScheme {
+                RuleSchemeCard(
+                    scheme: selfConfigurationScheme,
+                    previewScheme: model.rulesPageSummaries[selfConfigurationScheme.id]?.preview ?? selfConfigurationScheme,
+                    isSelected: model.selectedPresetID == selfConfigurationScheme.id,
+                    ruleCount: model.rulesPageSummaries[selfConfigurationScheme.id]?.count,
+                    isRefreshing: model.importingSchemeIDs.contains(selfConfigurationScheme.id),
+                    isReady: model.rulesPageSummaries[selfConfigurationScheme.id]?.isReady ?? true,
+                    onCustomize: { customizationScheme = selfConfigurationScheme },
+                    onSelect: { model.selectScheme(selfConfigurationScheme) },
+                    onRefresh: { Task { await model.refreshScheme(selfConfigurationScheme) } },
+                    onEdit: { editingImportedScheme = selfConfigurationScheme },
+                    onDelete: { pendingDeletion = selfConfigurationScheme }
+                )
+            } else {
+                SelfConfigurationDownloadCard(
+                    isWorking: model.isImportingScheme,
+                    errorMessage: selfConfigurationError,
+                    onDownload: { Task { await downloadSelfConfiguration() } }
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var importedSchemesSection: some View {
+        let schemes = model.ruleSchemes.filter {
+            !$0.isBundled && !SelfConfigurationSource.matches($0)
+        }
+        Group {
+            SectionHeading(title: "已导入", detail: String(localized: "\(schemes.count) 个方案"))
+            if schemes.isEmpty {
+                Text("还没有导入规则，使用右上角按钮添加。")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(16)
+                    .towerCard()
+            } else {
+                ForEach(schemes) { scheme in
+                    RuleSchemeCard(
+                        scheme: scheme,
+                        previewScheme: model.rulesPageSummaries[scheme.id]?.preview ?? scheme,
+                        isSelected: model.selectedPresetID == scheme.id,
+                        ruleCount: model.rulesPageSummaries[scheme.id]?.count,
+                        isRefreshing: model.importingSchemeIDs.contains(scheme.id),
+                        isReady: model.rulesPageSummaries[scheme.id]?.isReady ?? true,
+                        onCustomize: { customizationScheme = scheme },
+                        onSelect: { model.selectScheme(scheme) },
+                        onRefresh: { Task { await model.refreshScheme(scheme) } },
+                        onEdit: { editingImportedScheme = scheme },
+                        onDelete: { pendingDeletion = scheme }
+                    )
+
+                }
+            }
+        }
+    }
+
+    private func downloadSelfConfiguration() async {
+        selfConfigurationError = nil
+        do {
+            try await model.importScheme(
+                name: SelfConfigurationSource.name,
+                urlString: SelfConfigurationSource.downloadURL.absoluteString
+            )
+        } catch {
+            selfConfigurationError = error.localizedDescription
+        }
+    }
+}
+
+private struct RuleDisclosureRow: View {
+    let title: String
+    let isExpanded: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                Spacer()
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.bold))
+                    .rotationEffect(.degrees(isExpanded ? 180 : 0))
+            }
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SelectionIndicatorButtonStyle())
+    }
+}
+
+/// Imported groups display only the emoji actually present in their names.
+struct RuleGroupEmoji: View {
+    let group: RuleSchemeGroup
+    let isVisible: Bool
+    let inferFromName: Bool
+
+    var body: some View {
+        let emoji = RulePolicyPresentation.emoji(for: group.name, kind: group.kind, inferFromName: inferFromName)
+        if !emoji.isEmpty {
+            Text(emoji)
+            .font(.body)
+            .frame(width: 28, height: 28)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            .opacity(isVisible ? 1 : 0)
+            .accessibilityHidden(!isVisible)
+            .animation(nil, value: isVisible)
+        }
+    }
+}
+
+private struct RuleDetailLine: View {
+    let title: String
+    let detail: String
+    var trailing: String?
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline)
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            if let trailing {
+                Text(trailing)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
+private struct LocalRuleSetEditorRequest: Identifiable {
+    let ruleSet: LocalRuleSet?
+
+    var id: String {
+        ruleSet?.id.uuidString ?? "new"
+    }
+}
+
+private struct SelfConfigurationDownloadCard: View {
+    let isWorking: Bool
+    let errorMessage: String?
+    let onDownload: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(SelfConfigurationSource.name)
+                .font(.headline)
+
+            Text(SelfConfigurationSource.summary)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Button(action: onDownload) {
+                HStack {
+                    if isWorking { ProgressView().controlSize(.small) }
+                    Text(isWorking ? "正在下载…" : "手动下载")
+                        .font(.subheadline.weight(.semibold))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 11)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(isWorking)
+            .accessibilityIdentifier("download-self-configuration")
+
+            Link("查看项目来源", destination: SelfConfigurationSource.projectURL)
+                .font(.caption)
+
+            Text("规则由您直接从上游下载，不随 App 分发。下载后保存在本机。")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .towerCard()
+    }
+}
+
+private struct RuleSchemeCard: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let scheme: RuleScheme
+    let previewScheme: RuleScheme
+    let isSelected: Bool
+    let ruleCount: Int?
+    let isRefreshing: Bool
+    let isReady: Bool
+    let onCustomize: () -> Void
+    let onSelect: () -> Void
+    let onRefresh: (() -> Void)?
+    let onEdit: (() -> Void)?
+    let onDelete: (() -> Void)?
+    @State private var isExpanded = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 0) {
+                HStack(alignment: .top, spacing: 8) {
+                    Button(action: onCustomize) {
+                        HStack(alignment: .center, spacing: 10) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text(scheme.name)
+                                    .font(.headline)
+                                Text(scheme.localizedSummary())
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .multilineTextAlignment(.leading)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text("\(ruleCount.map { $0.formatted() } ?? "—") 条 · \(previewScheme.groups.count) 个策略组")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                                if !isReady {
+                                    Label("部分规则还没下载完成", systemImage: "exclamationmark.triangle.fill")
+                                        .font(.caption)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            Spacer(minLength: 4)
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.tertiary)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SelectionIndicatorButtonStyle())
+                    .accessibilityIdentifier("rule-customization-\(scheme.id)")
+                    .accessibilityLabel("编辑 \(scheme.name)")
+
+                    Button(action: onSelect) {
+                        SelectionIndicator(isSelected: isSelected)
+                            .frame(width: 44, height: 44, alignment: .topTrailing)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SelectionIndicatorButtonStyle())
+                    .accessibilityLabel(isSelected ? "\(scheme.name)，当前使用" : "使用 \(scheme.name)")
+                }
+                .padding(16)
+                .accessibilityIdentifier("scheme-\(scheme.id)")
+
+
+                Divider()
+
+                HStack(spacing: 0) {
+                    RuleDisclosureRow(title: String(localized: "查看策略组"), isExpanded: isExpanded) {
+                        withAnimation(TowerMotion.disclosure(reduceMotion: reduceMotion)) { isExpanded.toggle() }
+                    }
+                    .accessibilityIdentifier("scheme-detail-\(scheme.id)")
+
+                    if let onRefresh {
+                        Divider().frame(height: 22)
+                        Button(action: onRefresh) {
+                            Group {
+                                if isRefreshing {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Image(systemName: "arrow.triangle.2.circlepath")
+                                }
+                            }
+                            .frame(width: 46, height: 44)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(SelectionIndicatorButtonStyle())
+                        .disabled(isRefreshing)
+                        .accessibilityLabel("刷新 \(scheme.name)")
+                    }
+                }
+            }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: TowerTheme.cornerRadius))
+            .contextMenu {
+                if let onEdit {
+                    Button(action: onEdit) {
+                        Label("编辑", systemImage: "pencil")
+                    }
+                }
+                if let onRefresh {
+                    Button(action: onRefresh) {
+                        Label("刷新规则", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                }
+                if let onDelete {
+                    Button(role: .destructive, action: onDelete) {
+                        Label("删除", systemImage: "trash")
+                    }
+                }
+            }
+            .modifier(CardSwipeDeletion(onDelete: onDelete))
+
+            if isExpanded {
+                // Policy summaries are bounded; measure the full expanded height
+                // so scrolling does not change the card's estimated size.
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(previewScheme.groups, id: \.name) { group in
+                        RuleDetailLine(title: group.name, detail: description(of: group))
+                    }
+                    Divider()
+                    RuleDetailLine(
+                        title: String(localized: "规则列表"),
+                        detail: String(localized: "\(previewScheme.remoteRulesetURLs.count) 个")
+                    )
+                    if let updatedAt = scheme.updatedAt {
+                        RuleDetailLine(
+                            title: String(localized: "更新时间"),
+                            detail: updatedAt.formatted(date: .abbreviated, time: .shortened)
+                        )
+                    }
+                    Text(scheme.isBundled
+                        ? String(localized: "这份方案随 App 打包，完全离线可用。")
+                        : String(localized: "规则列表已下载到本机，生成配置时不再联网。"))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+                .transition(.opacity)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: TowerTheme.cornerRadius, style: .continuous))
+        // Selection is the check mark alone; a coloured outline on top of it
+        // said the same thing twice.
+        .towerCard()
+        // As in SubscriptionCard, background and text share one moving frame.
+        .contentShape(RoundedRectangle(cornerRadius: TowerTheme.cornerRadius))
+        .transition(.opacity)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("scheme-card-\(scheme.id)")
+    }
+
+    private func description(of group: RuleSchemeGroup) -> String {
+        let kind = group.kind.displayTitle
+        let references = group.members.filter {
+            if case .reference = $0 { return true }
+            return false
+        }.count
+        let patterns = group.members.count - references
+        var parts = [kind]
+        if references > 0 { parts.append(String(localized: "\(references) 个引用")) }
+        if patterns > 0 { parts.append(String(localized: "\(patterns) 组节点匹配")) }
+        return parts.joined(separator: " · ")
+    }
+}
+
+private struct ImportedRuleSchemeEditor: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var requestsDiscard = false
+    let scheme: RuleScheme
+    @State private var name: String
+    @State private var summary: String
+
+    init(scheme: RuleScheme) {
+        self.scheme = scheme
+        _name = State(initialValue: scheme.name)
+        _summary = State(initialValue: scheme.localizedSummary())
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("名称", text: $name)
+                    TextField("简介", text: $summary, axis: .vertical)
+                        .lineLimit(3...6)
+                } footer: {
+                    Text("只修改显示信息，不会更改规则内容或来源链接。")
+                }
+            }
+            .navigationTitle("编辑规则方案")
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmDiscardChanges(hasChanges: name != scheme.name || summary != scheme.localizedSummary(), requested: $requestsDiscard)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { requestsDiscard = true }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        if model.updateImportedSchemeMetadata(
+                            id: scheme.id,
+                            name: name,
+                            summary: summary
+                        ) {
+                            dismiss()
+                        }
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+private struct CatalogRuleEditorRequest: Identifiable {
+    let scheme: RuleScheme
+    let flow: CustomRuleFlow
+
+    var id: UUID { flow.id }
+}
+
+private struct RuleGroupDeletionRequest: Identifiable {
+    let scheme: RuleScheme
+    let group: RuleSchemeGroup
+    let references: [String]
+
+    var id: String { "\(scheme.id)::\(group.name)" }
+}
+
+private enum RuleCustomizationDeletion {
+    case catalog(CustomRuleFlow)
+    case localRuleSet(LocalRuleSet)
+    case group(RuleGroupDeletionRequest)
+
+    var title: String {
+        switch self {
+        case .catalog(let flow):
+            String(localized: "删除“\(flow.name)”？")
+        case .localRuleSet(let ruleSet):
+            String(localized: "删除“\(ruleSet.name)”？")
+        case .group(let request):
+            String(localized: "删除“\(request.group.name)”？")
+        }
+    }
+
+    var actionTitle: String {
+        switch self {
+        case .localRuleSet: String(localized: "删除本地规则集")
+        case .catalog, .group: String(localized: "删除")
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .catalog:
+            String(localized: "只移除塔台保存的这项自定义，不会修改上游仓库。")
+        case .localRuleSet:
+            String(localized: "这会删除本机保存的规则内容，并从所有当前方案中移除；不会修改上游仓库。")
+        case .group(let request) where !request.references.isEmpty:
+            String(
+                localized: "以下分组正在引用它：\(request.references.joined(separator: "、"))。继续删除后会同时移除这些引用；没有候选项的分组会回退到 DIRECT。"
+            )
+        case .group:
+            String(localized: "这会移除该分组以及指向它的规则，不会修改上游仓库。")
+        }
+    }
+}
+
+/// A drag that changed where some sites go, kept until the user keeps or
+/// undoes it.
+private struct ReorderNotice {
+    let previousGroups: [String]
+    let previousMatching: [String]
+    let conflicts: [RuleOrderConflict]
+
+    var message: String {
+        var lines = conflicts.prefix(3).map { conflict in
+            let from = RulePolicyPresentation.nameWithoutLeadingEmoji(conflict.from)
+            let to = RulePolicyPresentation.nameWithoutLeadingEmoji(conflict.to)
+            // Shortest first: youtube.com says more than youtubei.googleapis.com.
+            let examples = conflict.domains.sorted { $0.count < $1.count }.prefix(2).joined(separator: "、")
+            return String(localized: "「\(from)」中 \(conflict.domains.count) 个域名改走「\(to)」，如 \(examples)")
+        }
+        if conflicts.count > 3 { lines.append("…") }
+        lines.append("")
+        lines.append(String(localized: "规则从上到下匹配，同一个域名只会命中排在前面的组。"))
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// One predictable place for every rule-level decision: existing service
+/// groups, protected routing primitives, maintained catalogs and advanced
+/// hand-written rules. Search is the primary path; raw syntax stays one level
+/// deeper for people who actually need it.
+private struct RuleCustomizationSheet: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let scheme: RuleScheme
+    @State private var path: [RuleCustomizationRoute] = []
+    @State private var searchText = ""
+    /// Local copy of the dragged order so the list does not jump while the
+    /// scheme is rematerialized.
+    @State private var draftGroupOrder: [String] = []
+    @State private var reorderNotice: ReorderNotice?
+    @State private var selectedCategory: RuleCatalogCategory?
+    @State private var manualEditor: LocalRuleSetEditorRequest?
+    @State private var catalogEditor: CatalogRuleEditorRequest?
+    @State private var networkSettingsEditor: RuleScheme?
+    @State private var configurationEditor: RuleScheme?
+    @State private var pendingDeletion: RuleCustomizationDeletion?
+    @State private var installingIDs = Set<String>()
+    @State private var errorMessage: String?
+    @State private var showsSaveScheme = false
+    @State private var showsResetConfirmation = false
+
+    private var trimmedSearch: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var groups: [RuleSchemeGroup] {
+        model.customizableRuleGroups(for: scheme)
+    }
+
+    private func matchesSearch(_ group: RuleSchemeGroup) -> Bool {
+        trimmedSearch.isEmpty
+            || group.name.localizedCaseInsensitiveContains(trimmedSearch)
+            || groupModeTitle(group).localizedCaseInsensitiveContains(trimmedSearch)
+    }
+
+    /// Every group in one list, in the order clients show them. The home
+    /// card preview and every export use the same order.
+    private var listGroups: [RuleSchemeGroup] {
+        guard !draftGroupOrder.isEmpty else { return groups }
+        let byName = Dictionary(groups.map { ($0.name, $0) }, uniquingKeysWith: { first, _ in first })
+        let ordered = draftGroupOrder.compactMap { byName[$0] }
+        return ordered.count == groups.count ? ordered : groups
+    }
+
+    private var finalGroupName: String? {
+        model.customizableScheme(for: scheme).finalGroupName
+    }
+
+    private var visibleCatalogEntries: [RuleCatalogEntry] {
+        RuleCatalog.builtIn.entries.filter { entry in
+            (selectedCategory == nil || entry.category == selectedCategory)
+                && (trimmedSearch.isEmpty || entry.matches(trimmedSearch))
+        }
+    }
+
+    private var visibleLocalRuleSets: [LocalRuleSet] {
+        guard !trimmedSearch.isEmpty else { return model.localRuleSets }
+        return model.localRuleSets.filter {
+            $0.name.localizedCaseInsensitiveContains(trimmedSearch)
+                || $0.normalizedRules.contains { $0.localizedCaseInsensitiveContains(trimmedSearch) }
+        }
+    }
+
+    private var compactRuleRowInsets: EdgeInsets {
+        EdgeInsets(top: 6, leading: 16, bottom: 6, trailing: 16)
+    }
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            List {
+                schemeUsageSection
+                ruleGroupsSection
+                localRuleSetsSection
+                catalogSections
+            }
+            .environment(\.editMode, .constant(.active))
+            .navigationTitle("规则定制")
+            .navigationBarTitleDisplayMode(.inline)
+            .searchable(
+                text: $searchText,
+                placement: .navigationBarDrawer(displayMode: .always),
+                // Not "在线搜索": this filters the bundled catalog and the
+                // user's own local library. Nothing here reaches the network,
+                // which is the whole promise of the screen.
+                prompt: "搜索规则：如 YouTube OpenAI"
+            )
+            .scrollDismissesKeyboard(.interactively)
+            .accessibilityIdentifier("rule-customization-list")
+            .navigationDestination(for: RuleCustomizationRoute.self) { route in
+                switch route {
+                case .group(let name):
+                    RuleGroupDetailView(scheme: scheme, groupName: name) { group in
+                        requestDeletion(of: group)
+                    }
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Menu {
+                        Button {
+                            toggleRuleGroupEmojiVisibilityAfterMenuDismiss()
+                        } label: {
+                            Label(model.ruleGroupEmojisAreEnabled(for: scheme) ? "隐藏 Emoji" : "显示 Emoji", systemImage: "face.smiling")
+                        }
+                        // Imported schemes only: the bundled ones all carry emoji.
+                        if !scheme.isBundled, model.ruleGroupEmojisAreEnabled(for: scheme) {
+                            Button {
+                                toggleRuleGroupEmojiAutofillAfterMenuDismiss()
+                            } label: {
+                                Label(model.ruleGroupEmojiAutofillEnabled(for: scheme) ? "不再自动补全 Emoji" : "自动补全 Emoji",
+                                      systemImage: "wand.and.stars")
+                            }
+                        }
+                        Button {
+                            networkSettingsEditor = model.customizableScheme(for: scheme)
+                        } label: {
+                            Label("DNS 与网络", systemImage: "network")
+                        }
+                        Button {
+                            openConfigurationEditor()
+                        } label: {
+                            Label("手动编辑配置", systemImage: "doc.text")
+                        }
+                        Button {
+                            showsSaveScheme = true
+                        } label: {
+                            Label("另存为新方案", systemImage: "square.and.arrow.down")
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            showsResetConfirmation = true
+                        } label: {
+                            Label("恢复初始规则", systemImage: "arrow.counterclockwise")
+                        }
+                    } label: {
+                        Text("编辑")
+                            .foregroundStyle(.tint)
+                    }
+                    .accessibilityIdentifier("rule-actions-menu")
+                }
+                ToolbarItemGroup(placement: .confirmationAction) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
+            }
+            .sheet(item: $manualEditor) { request in
+                LocalRuleSetEditor(ruleSet: request.ruleSet)
+                    .environmentObject(model)
+            }
+            .sheet(item: $catalogEditor) { request in
+                CatalogRuleRouteEditor(scheme: request.scheme, flow: request.flow)
+            }
+            .sheet(item: $networkSettingsEditor) { editableScheme in
+                RuleSchemeNetworkSettingsEditor(scheme: editableScheme)
+            }
+            .sheet(item: $configurationEditor) { editableScheme in
+                RuleSchemeConfigurationEditor(scheme: editableScheme) {
+                    dismiss()
+                }
+            }
+            .sheet(isPresented: $showsSaveScheme) {
+                SaveCustomizedSchemeSheet(model: model, scheme: scheme) {
+                    dismiss()
+                }
+            }
+            .confirmationDialog("恢复初始规则",
+                isPresented: $showsResetConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("恢复初始规则", role: .destructive) {
+                    restoreInitialRules()
+                }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("这会移除当前方案后来添加的规则、改名和 Emoji 设置；“我的规则集”中的本地内容会保留。")
+            }
+            .alert(
+                pendingDeletion?.title ?? String(localized: "确认删除"),
+                isPresented: Binding(
+                    get: { pendingDeletion != nil },
+                    set: { if !$0 { pendingDeletion = nil } }
+                ),
+                presenting: pendingDeletion
+            ) { deletion in
+                Button(deletion.actionTitle, role: .destructive) {
+                    switch deletion {
+                    case .catalog(let flow):
+                        model.deleteCustomRuleFlow(flow)
+                    case .localRuleSet(let ruleSet):
+                        model.deleteLocalRuleSet(ruleSet)
+                    case .group(let request):
+                        if path.last == .group(request.group.name) { path.removeLast() }
+                        model.deleteRuleGroup(named: request.group.name, for: request.scheme)
+                    }
+                    pendingDeletion = nil
+                }
+                Button("取消", role: .cancel) { pendingDeletion = nil }
+            } message: { deletion in
+                Text(deletion.message)
+            }
+            .alert(
+                "匹配结果会改变",
+                isPresented: Binding(
+                    get: { reorderNotice != nil },
+                    set: { if !$0 { reorderNotice = nil } }
+                ),
+                presenting: reorderNotice
+            ) { notice in
+                Button("撤销") {
+                    draftGroupOrder = notice.previousGroups
+                    model.setRuleGroupOrder(notice.previousGroups, for: scheme)
+                    model.setMatchingOrder(notice.previousMatching, for: scheme)
+                    reorderNotice = nil
+                }
+                Button("保留新顺序", role: .cancel) { reorderNotice = nil }
+            } message: { notice in
+                Text(notice.message)
+            }
+            .alert("无法添加规则", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("好的") { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "")
+            }
+            .towerToast()
+        }
+        .presentationDetents([.large])
+        .onChange(of: groups.map(\.name)) { names in
+            draftGroupOrder = names
+        }
+    }
+
+    private func restoreInitialRules() {
+        searchText = ""
+        selectedCategory = nil
+        path = []
+        draftGroupOrder = []
+        model.resetRuleCustomization(for: scheme)
+    }
+
+    private func toggleRuleGroupEmojiAutofillAfterMenuDismiss() {
+        let enabled = !model.ruleGroupEmojiAutofillEnabled(for: scheme)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                model.setRuleGroupEmojiAutofill(enabled, for: scheme)
+            }
+        }
+    }
+
+    private func toggleRuleGroupEmojiVisibilityAfterMenuDismiss() {
+        let enabled = !model.ruleGroupEmojisAreEnabled(for: scheme)
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(180))
+            guard !Task.isCancelled else { return }
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                model.setRuleGroupEmojisEnabled(enabled, for: scheme)
+            }
+        }
+    }
+
+    private var categoryPicker: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                categoryButton(nil, title: String(localized: "全部"))
+                ForEach(RuleCatalogCategory.allCases, id: \.self) { category in
+                    categoryButton(category, title: category.displayName)
+                }
+            }
+            .padding(.horizontal, 16)
+        }
+    }
+
+    @ViewBuilder
+    private var catalogSections: some View {
+        Section {
+            categoryPicker
+                .listRowInsets(EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0))
+        } header: {
+            HStack {
+                Text("在线规则库")
+                Spacer()
+                Text("\(visibleCatalogEntries.count) 项")
+            }
+        } footer: {
+            Text("规则从 ACL4SSR 与 blackmatrix7 的官方仓库按需下载。点击加号后会直接加入当前规则。")
+        }
+
+        if visibleCatalogEntries.isEmpty {
+            TowerContentUnavailableView.search(text: trimmedSearch)
+                .listRowBackground(Color.clear)
+        } else {
+            Section {
+                ForEach(visibleCatalogEntries) { entry in
+                    catalogRow(entry)
+                }
+            }
+        }
+    }
+
+    private var localRuleSetsSection: some View {
+        Section {
+            Button {
+                manualEditor = LocalRuleSetEditorRequest(ruleSet: nil)
+            } label: {
+                Label {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("新建规则集")
+                            .foregroundStyle(.primary)
+                        Text("支持手动创建规则和引用规则集。")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "text.badge.plus")
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+            .accessibilityIdentifier("local-rule-create")
+            .listRowInsets(compactRuleRowInsets)
+
+            ForEach(visibleLocalRuleSets) { ruleSet in
+                localRuleSetRow(ruleSet)
+                    .listRowInsets(compactRuleRowInsets)
+                    .contextMenu {
+                        Button {
+                            manualEditor = LocalRuleSetEditorRequest(ruleSet: ruleSet)
+                        } label: {
+                            Label("编辑规则内容", systemImage: "pencil")
+                        }
+                        Button(role: .destructive) {
+                            pendingDeletion = .localRuleSet(ruleSet)
+                        } label: {
+                            Label("删除本地规则集", systemImage: "trash")
+                        }
+                    }
+            }
+        } header: {
+            HStack {
+                Text("我的规则集")
+                Spacer()
+                Text("\(model.localRuleSets.count) 个")
+            }
+        } footer: {
+            Text("新建的规则集先保存在本机。点击右侧加号后才会加入当前规则，更新上游方案时不会被覆盖。")
+        }
+    }
+
+    /// Editing a scheme never selects it. Without this, customizing an
+    /// unselected scheme looked like it had no effect on the export.
+    @ViewBuilder
+    private var schemeUsageSection: some View {
+        if model.selectedPresetID != scheme.id {
+            Section {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label {
+                        Text("导出当前使用「\(model.activeRuleName)」，这里的修改不会影响导出。")
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: "info.circle.fill")
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    Button("改用此方案") {
+                        withAnimation(TowerMotion.disclosure(reduceMotion: reduceMotion)) {
+                            model.selectScheme(scheme)
+                        }
+                    }
+                    // Only the button, not the explanatory row, selects.
+                    .buttonStyle(.borderless)
+                    .font(.subheadline.weight(.semibold))
+                    .accessibilityIdentifier("customization-use-scheme")
+                }
+                .padding(.vertical, 4)
+            }
+            .transition(.opacity)
+        }
+    }
+
+    /// One list in the order clients show the groups, the same order as the
+    /// home card preview and the export. Dragging a group that owns rules
+    /// also moves its matching priority next to where it was dropped (issue
+    /// #45); only that group moves, never the whole list (issue #40).
+    @ViewBuilder
+    private var ruleGroupsSection: some View {
+        let visible = listGroups.filter(matchesSearch)
+        if !visible.isEmpty {
+            Section {
+                ForEach(visible, id: \.name) { group in
+                    groupRow(group)
+                        .background(MacListReorderBridge(enabled: trimmedSearch.isEmpty))
+                        .moveDisabled(!trimmedSearch.isEmpty)
+                }
+                .onMove { source, destination in
+                    guard trimmedSearch.isEmpty else { return }
+                    moveGroups(from: source, to: destination)
+                }
+            } header: {
+                HStack {
+                    Text("分流规则")
+                    Spacer()
+                    Text("\(visible.count) 组")
+                }
+            } footer: {
+                Text("拖动调整策略组在客户端里的顺序，也调整它的匹配优先级：拖到某组下面就排在它之后匹配，拖到上面就排在它之前。有网站因此改走别的组时会提示，可以撤销。")
+            }
+        }
+    }
+
+    private func groupRow(_ group: RuleSchemeGroup) -> some View {
+        Button {
+            path.append(.group(group.name))
+        } label: {
+            HStack(spacing: 10) {
+                customRuleGroupRow(group)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SelectionIndicatorButtonStyle())
+        .listRowInsets(compactRuleRowInsets)
+        .accessibilityIdentifier("rule-group-\(group.name)")
+        .contextMenu {
+            if let flow = userCreatedFlow(for: group), let ruleSet = localRuleSet(for: flow) {
+                Button {
+                    manualEditor = LocalRuleSetEditorRequest(ruleSet: ruleSet)
+                } label: {
+                    Label("编辑规则内容", systemImage: "doc.text.magnifyingglass")
+                }
+            }
+            Button(role: .destructive) { requestDeletion(of: group) } label: {
+                Label("删除", systemImage: "trash")
+            }
+        }
+    }
+
+    private func moveGroups(from source: IndexSet, to destination: Int) {
+        let previous = listGroups.map(\.name)
+        guard let from = source.first else { return }
+        let moved = previous[from]
+        var names = previous
+        names.move(fromOffsets: source, toOffset: destination)
+        guard names != previous else { return }
+        let previousMatching = model.matchingRuleGroupNames(for: scheme)
+        let newMatching = model.matchingOrderAfterDragging(moved, from: previous, to: names, in: scheme)
+        // First match wins in every client, so passing a group that matches
+        // the same sites hands them over. Say which, and offer to undo,
+        // rather than let the export change silently.
+        let conflicts = model.matchingOrderConflicts(from: previousMatching, to: newMatching, in: scheme)
+        let scattered = newMatching != previousMatching && scatteredRuleCount(of: moved) > 1
+        draftGroupOrder = names
+        model.setRuleGroupOrder(names, for: scheme)
+        model.setMatchingOrder(newMatching, for: scheme)
+        if !conflicts.isEmpty {
+            reorderNotice = ReorderNotice(previousGroups: previous, previousMatching: previousMatching, conflicts: conflicts)
+        } else if scattered {
+            model.showToast(
+                String(localized: "「\(RulePolicyPresentation.nameWithoutLeadingEmoji(moved))」的规则原本分布在多处，已一起移到这里"),
+                symbol: "arrow.up.arrow.down",
+                tone: .neutral
+            )
+        }
+    }
+
+    /// Number of separate places a group's rules appear in matching order.
+    private func scatteredRuleCount(of name: String) -> Int {
+        var runs = 0
+        var previous: String?
+        for ruleset in model.customizableScheme(for: scheme).rulesets where ruleset.origin != .supplement {
+            if ruleset.groupName == name, previous != name { runs += 1 }
+            previous = ruleset.groupName
+        }
+        return runs
+    }
+
+    private func userCreatedFlow(for group: RuleSchemeGroup) -> CustomRuleFlow? {
+        let sourceName = model.sourceRuleGroupName(group.name, for: scheme)
+        return model.customRuleFlows(for: scheme).first { flow in
+            flow.catalogID == nil
+                && [group.name, sourceName].contains(flow.generatedPolicyGroup?.name)
+        }
+    }
+
+    private func localRuleSet(for flow: CustomRuleFlow) -> LocalRuleSet? {
+        guard let localRuleSetID = flow.localRuleSetID else { return nil }
+        return model.localRuleSets.first { $0.id == localRuleSetID }
+    }
+
+    private func localRuleSetRow(_ ruleSet: LocalRuleSet) -> some View {
+        let isAdded = model.isLocalRuleSetAdded(ruleSet, to: scheme)
+        return HStack(spacing: 12) {
+            Button {
+                manualEditor = LocalRuleSetEditorRequest(ruleSet: ruleSet)
+            } label: {
+                HStack(spacing: 12) {
+                    Text("🧩")
+                        .font(.title3)
+                        .frame(width: 36, height: 36)
+                        .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(ruleSet.name)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(localRuleSetSummary(ruleSet))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(SelectionIndicatorButtonStyle())
+            .accessibilityIdentifier("local-rule-set-\(ruleSet.name)")
+
+            Button {
+                if isAdded {
+                    model.removeLocalRuleSet(ruleSet, from: scheme)
+                } else {
+                    model.addLocalRuleSet(ruleSet, to: scheme)
+                }
+            } label: {
+                Image(systemName: isAdded ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.title3)
+                    .foregroundStyle(isAdded ? Color.green : Color.accentColor)
+            }
+            .buttonStyle(SelectionIndicatorButtonStyle())
+            .accessibilityLabel(isAdded ? "从当前规则移除" : "加入当前规则")
+            .accessibilityValue(isAdded ? "已添加" : "未添加")
+        }
+    }
+
+    private func localRuleSetSummary(_ ruleSet: LocalRuleSet) -> String {
+        if ruleSet.remoteRuleURL != nil {
+            return String(localized: "本地 · 远程规则集")
+        }
+        return String(localized: "本地 · \(ruleSet.normalizedRules.count) 条规则")
+    }
+
+    private func requestDeletion(of group: RuleSchemeGroup) {
+        pendingDeletion = .group(
+            RuleGroupDeletionRequest(
+                scheme: scheme,
+                group: group,
+                references: model.ruleGroupReferences(to: group.name, for: scheme)
+            )
+        )
+    }
+
+    private func customRuleGroupRow(_ group: RuleSchemeGroup) -> some View {
+        HStack(spacing: 10) {
+            visibleRuleGroupEmoji(group)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(RulePolicyPresentation.nameWithoutLeadingEmoji(group.name))
+                    .foregroundStyle(Color.primary)
+                Text(groupRowDetail(group))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(minHeight: 44)
+    }
+
+    /// "→ 节点选择 · 2 个列表 · 我添加 3 条": where it goes and what feeds it.
+    private func groupRowDetail(_ group: RuleSchemeGroup) -> String {
+        if group.name == finalGroupName {
+            return String(localized: "→ \(groupSelectionSummary(group)) · 其余所有流量")
+        }
+        var parts = scheme.groupEditorMode(for: group) == .nodePatternsOnly
+            ? [String(localized: "\(group.kind.displayTitle) · 按节点名称筛选")]
+            : [String(localized: "→ \(groupSelectionSummary(group))")]
+        let sources = model.ruleSources(forGroup: group.name, in: scheme).count
+        if sources > 0 { parts.append(String(localized: "\(sources) 项规则")) }
+        let added = model.supplementRules(forGroup: group.name, in: scheme).count
+        if added > 0 { parts.append(String(localized: "我添加 \(added) 条")) }
+        return parts.joined(separator: " · ")
+    }
+
+    private func visibleRuleGroupEmoji(_ group: RuleSchemeGroup) -> some View {
+        RuleGroupEmoji(group: group, isVisible: model.ruleGroupEmojisAreEnabled(for: scheme), inferFromName: scheme.isBundled)
+    }
+
+    private func groupModeTitle(_ group: RuleSchemeGroup) -> String {
+        group.kind.displayTitle
+    }
+
+    private func groupSelectionSummary(_ group: RuleSchemeGroup) -> String {
+        if scheme.groupEditorMode(for: group) == .nodePatternsOnly {
+            return group.kind.displayTitle
+        }
+        if let reference = group.members.compactMap({ member -> String? in
+            guard case .reference(let name) = member else { return nil }
+            return name
+        }).first {
+            switch reference.uppercased() {
+            case "DIRECT": return String(localized: "直连")
+            case "REJECT": return String(localized: "拒绝")
+            default: return RulePolicyPresentation.nameWithoutLeadingEmoji(reference)
+            }
+        }
+        return group.kind.displayTitle
+    }
+
+    private func categoryButton(_ category: RuleCatalogCategory?, title: String) -> some View {
+        Button {
+            selectedCategory = category
+        } label: {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(selectedCategory == category ? Color.white : Color.primary)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 8)
+                .background(
+                    selectedCategory == category ? Color.accentColor : Color.secondary.opacity(0.1),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(SelectionIndicatorButtonStyle())
+    }
+
+    private func catalogRow(_ entry: RuleCatalogEntry) -> some View {
+        let installed = model.catalogFlow(for: entry, in: scheme)
+        let isInstalling = installingIDs.contains(entry.id)
+        return Button {
+            if installed != nil {
+                model.removeCatalogEntry(entry, from: scheme)
+            } else {
+                install(entry)
+            }
+        } label: {
+            HStack(spacing: 12) {
+                Text(entry.emoji)
+                    .font(.title3)
+                    .frame(width: 36, height: 36)
+                    .background(tint(for: entry.defaultRoute).opacity(0.11), in: RoundedRectangle(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.name)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    Text("\(entry.provider.displayName) · \(routeTitle(entry))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 8)
+                if isInstalling {
+                    ProgressView()
+                } else {
+                    Image(systemName: installed == nil ? "plus.circle" : "checkmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(installed == nil ? Color.accentColor : Color.green)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(SelectionIndicatorButtonStyle())
+        .disabled(isInstalling)
+        .listRowInsets(compactRuleRowInsets)
+        .accessibilityIdentifier("catalog-entry-\(entry.id)")
+        .accessibilityValue(installed == nil ? "未添加" : "已添加")
+        .accessibilityHint(installed == nil ? "添加到自定义规则" : "从自定义规则移除")
+        .contextMenu {
+            if let installed {
+                Button {
+                    catalogEditor = CatalogRuleEditorRequest(scheme: scheme, flow: installed)
+                } label: {
+                    Label("编辑", systemImage: "pencil")
+                }
+                Button(role: .destructive) { pendingDeletion = .catalog(installed) } label: {
+                    Label("删除", systemImage: "trash")
+                }
+            }
+        }
+    }
+
+    private func install(_ entry: RuleCatalogEntry) {
+        installingIDs.insert(entry.id)
+        Task {
+            defer { installingIDs.remove(entry.id) }
+            do {
+                try await model.installCatalogEntry(entry, for: scheme)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func openConfigurationEditor() {
+        configurationEditor = model.manualConfigurationEditingScheme(for: scheme)
+    }
+
+    private func symbol(for category: RuleCatalogCategory) -> String {
+        switch category {
+        case .ai: "sparkles"
+        case .streaming: "play.rectangle.fill"
+        case .social: "message.fill"
+        case .gaming: "gamecontroller.fill"
+        case .advertising: "hand.raised.fill"
+        case .domestic: "location.fill"
+        case .infrastructure: "network"
+        case .other: "square.grid.2x2.fill"
+        }
+    }
+
+    private func tint(for route: RuleCatalogDefaultRoute) -> Color {
+        switch route {
+        case .proxy: .accentColor
+        case .direct: .green
+        case .reject: .red
+        }
+    }
+
+    private func routeTitle(_ entry: RuleCatalogEntry) -> String {
+        switch entry.defaultRoute {
+        case .proxy: entry.suggestedPolicyName ?? String(localized: "节点选择")
+        case .direct: String(localized: "直连")
+        case .reject: String(localized: "拒绝")
+        }
+    }
+
+}
+
+private struct RuleSchemeNetworkSettingsEditor: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var requestsDiscard = false
+    let scheme: RuleScheme
+    @State private var draft: RuleSchemeNetworkSettingsDraft
+    @State private var latencyTestPreset: RuleSchemeLatencyTestPreset
+    @State private var errorMessage: String?
+    private let originalDraft: RuleSchemeNetworkSettingsDraft
+
+    init(scheme: RuleScheme) {
+        self.scheme = scheme
+        let initial = RuleSchemeNetworkSettingsDraft(settings: scheme.networkSettings)
+        _draft = State(initialValue: initial)
+        _latencyTestPreset = State(
+            initialValue: RuleSchemeLatencyTestPreset.selection(
+                for: initial.proxyTestURLString
+            )
+        )
+        originalDraft = initial
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Label {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("内置 DNS")
+                                .font(.headline)
+                            Text("将自动转换为每个客户端支持的写法")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "network")
+                            .foregroundStyle(.purple)
+                    }
+                }
+
+                Section {
+                    Picker("DNS 保护模式", selection: $draft.dnsProtectionMode) {
+                        ForEach(RuleSchemeDNSProtectionMode.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+
+                    if draft.dnsProtectionMode == .strict {
+                        Label {
+                            Text("可能影响局域网、公共网络认证和使用域名的代理节点。")
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    }
+                } header: {
+                    Text("DNS 保护")
+                } footer: {
+                    Text(draft.dnsProtectionMode.summary)
+                }
+
+                Section {
+                    ForEach(draft.dnsServers.indices, id: \.self) { index in
+                        dnsRow(
+                            symbol: "globe",
+                            placeholder: "例如 223.5.5.5",
+                            text: binding(for: index, in: \RuleSchemeNetworkSettingsDraft.dnsServers)
+                        ) {
+                            draft.dnsServers.remove(at: index)
+                        }
+                    }
+                    addRow(title: "添加普通 DNS") {
+                        draft.dnsServers.append("")
+                    }
+                } header: {
+                    Text("普通 DNS")
+                } footer: {
+                    Text("用于解析加密 DNS 和代理节点的域名，建议填写 IP 地址。")
+                }
+
+                Section {
+                    ForEach(draft.encryptedDNSServers.indices, id: \.self) { index in
+                        dnsRow(
+                            symbol: "lock.shield",
+                            placeholder: "https://example.com/dns-query",
+                            text: binding(
+                                for: index,
+                                in: \RuleSchemeNetworkSettingsDraft.encryptedDNSServers
+                            )
+                        ) {
+                            draft.encryptedDNSServers.remove(at: index)
+                        }
+                    }
+                    addRow(title: "添加国内 DNS") {
+                        draft.encryptedDNSServers.append("")
+                    }
+                } header: {
+                    Text("国内 DNS（直连）")
+                } footer: {
+                    Text("解析国内和直连网站，也用来解析代理节点的域名。支持 HTTPS、TLS 和 QUIC 地址；保存时会自动检查。")
+                }
+
+                Section {
+                    ForEach(draft.remoteDNSServers.indices, id: \.self) { index in
+                        dnsRow(
+                            symbol: "network.badge.shield.half.filled",
+                            placeholder: "https://dns.google/dns-query",
+                            text: binding(
+                                for: index,
+                                in: \RuleSchemeNetworkSettingsDraft.remoteDNSServers
+                            )
+                        ) {
+                            draft.remoteDNSServers.remove(at: index)
+                        }
+                    }
+                    addRow(title: "添加远程 DNS") {
+                        draft.remoteDNSServers.append("")
+                    }
+                } header: {
+                    Text("远程 DNS（经代理）")
+                } footer: {
+                    Text("只经代理访问，用于 sing-box 和 mihomo 系客户端。Google DNS 支持 ECS，能为未列出的国内网站取回国内地址。")
+                }
+
+                Section("网络") {
+                    Picker("IPv6", selection: $draft.ipv6Override) {
+                        Text("默认").tag(nil as Bool?)
+                        Text("开启").tag(true as Bool?)
+                        Text("关闭").tag(false as Bool?)
+                    }
+                }
+
+                Section {
+                    Menu {
+                        ForEach(RuleSchemeLatencyTestPreset.menuChoices) { preset in
+                            Button {
+                                latencyTestPresetBinding.wrappedValue = preset
+                            } label: {
+                                HStack {
+                                    RuleSchemeLatencyTestBrandLogoView(
+                                        brand: preset.brandLogo
+                                    )
+                                    Text(preset.title)
+
+                                    if preset == latencyTestPreset {
+                                        Image(systemName: "checkmark")
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 12) {
+                            RuleSchemeLatencyTestBrandLogoView(
+                                brand: latencyTestPreset.brandLogo
+                            )
+
+                            Text("测试服务")
+                                .foregroundStyle(.primary)
+
+                            Spacer(minLength: 12)
+
+                            Text(latencyTestPreset.title)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                                .accessibilityHidden(true)
+                        }
+                        .frame(minHeight: 44)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SelectionIndicatorButtonStyle())
+                    .accessibilityLabel("测试服务")
+                    .accessibilityValue(latencyTestPreset.title)
+
+                    if latencyTestPreset == .custom {
+                        TextField("测速地址", text: $draft.proxyTestURLString)
+                            .keyboardType(.URL)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        if let validationError = draft.latencyTestURLValidationError {
+                            Label {
+                                Text(validationError.localizedDescription)
+                            } icon: {
+                                Image(systemName: "exclamationmark.circle.fill")
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("latency-test-url-validation-error")
+                        }
+                    } else {
+                        LabeledContent("测速地址") {
+                            Text(draft.proxyTestURLString)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                } header: {
+                    Text("延迟测试")
+                } footer: {
+                    Text("选择常用服务，或完全手动填写 HTTP/HTTPS 测试地址。")
+                }
+
+                Section {
+                    Button {
+                        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                            draft = RuleSchemeNetworkSettingsDraft(settings: nil)
+                            latencyTestPreset = RuleSchemeLatencyTestPreset.selection(
+                                for: draft.proxyTestURLString
+                            )
+                        }
+                    } label: {
+                        Label("填入塔台默认值", systemImage: "arrow.counterclockwise")
+                    }
+                } footer: {
+                    Text("只影响“\(scheme.name)”生成的配置，不会改动订阅或上游规则文件。")
+                }
+            }
+            .navigationTitle("DNS 与网络")
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmDiscardChanges(hasChanges: draft != originalDraft, requested: $requestsDiscard)
+            .scrollDismissesKeyboard(.interactively)
+            .accessibilityIdentifier("rule-network-settings-editor")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { requestsDiscard = true }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { save() }
+                        .disabled(draft == originalDraft)
+                }
+            }
+            .alert("无法保存 DNS 设置", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("好") { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "")
+            }
+        }
+    }
+
+    private var latencyTestPresetBinding: Binding<RuleSchemeLatencyTestPreset> {
+        Binding(
+            get: { latencyTestPreset },
+            set: { preset in
+                latencyTestPreset = preset
+                draft.applyLatencyTestPreset(preset)
+            }
+        )
+    }
+
+    private func binding(
+        for index: Int,
+        in keyPath: WritableKeyPath<RuleSchemeNetworkSettingsDraft, [String]>
+    ) -> Binding<String> {
+        Binding(
+            get: {
+                guard draft[keyPath: keyPath].indices.contains(index) else { return "" }
+                return draft[keyPath: keyPath][index]
+            },
+            set: { value in
+                guard draft[keyPath: keyPath].indices.contains(index) else { return }
+                draft[keyPath: keyPath][index] = value
+            }
+        )
+    }
+
+    private func dnsRow(
+        symbol: String,
+        placeholder: String,
+        text: Binding<String>,
+        onDelete: @escaping () -> Void
+    ) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+            TextField(placeholder, text: text)
+                .keyboardType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button(role: .destructive, action: onDelete) {
+                Image(systemName: "minus.circle.fill")
+                    .symbolRenderingMode(.hierarchical)
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(SelectionIndicatorButtonStyle())
+            .accessibilityLabel("删除 DNS 服务器")
+        }
+    }
+
+    private func addRow(title: LocalizedStringKey, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: "plus.circle.fill")
+        }
+    }
+
+    private func save() {
+        do {
+            let settings = try draft.validatedSettings()
+            if settings == .towerDefault {
+                model.useTowerNetworkDefaults(for: scheme)
+            } else {
+                model.updateRuleSchemeNetworkSettings(settings, for: scheme)
+            }
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private struct RuleSchemeLatencyTestBrandLogoView: View {
+    let brand: RuleSchemeLatencyTestBrandLogo
+
+    var body: some View {
+        Image(brand.assetName)
+            .renderingMode(.original)
+            .resizable()
+            .scaledToFit()
+            .frame(width: 27, height: 27)
+            .accessibilityHidden(true)
+    }
+}
+
+private struct RuleSchemeConfigurationEditor: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var requestsDiscard = false
+    let scheme: RuleScheme
+    let onSaved: () -> Void
+    @State private var text: String
+    @State private var errorMessage: String?
+    @State private var isSaving = false
+    @State private var editorFocused = false
+    @State private var showsHelp = false
+    private let originalText: String
+
+    init(scheme: RuleScheme, onSaved: @escaping () -> Void) {
+        self.scheme = scheme
+        self.onSaved = onSaved
+        let source = RuleSchemeTextEditorService().editableText(for: scheme)
+        _text = State(initialValue: source)
+        originalText = source
+    }
+
+    private var lineCount: Int {
+        max(1, text.components(separatedBy: .newlines).count)
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        withAnimation(TowerMotion.disclosure(reduceMotion: reduceMotion)) {
+                            showsHelp.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Label("完整文本模式", systemImage: "curlybraces")
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            Image(systemName: "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .rotationEffect(.degrees(showsHelp ? 180 : 0))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(SelectionIndicatorButtonStyle())
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
+
+                    if showsHelp {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("支持 subconverter INI、Clash YAML 和 Surge 配置。保存时会检查语法、策略引用、测试地址和 DNS。")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                            Text("可在 [General] 中编辑 ipv6、dns-server、encrypted-dns-server 和 proxy-test-url；导出时会转换成各客户端支持的写法。")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 12)
+                        .transition(.opacity)
+                    }
+                }
+                .background(Color(uiColor: .secondarySystemGroupedBackground))
+
+                Divider()
+
+                ConfigurationEditorTextView(text: $text, isFocused: $editorFocused)
+
+                Divider()
+                HStack {
+                    Text("\(lineCount) 行")
+                    Spacer()
+                    Label("保存前自动检查", systemImage: "checkmark.shield")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .background(Color(uiColor: .secondarySystemGroupedBackground))
+            }
+            .background(Color(uiColor: .systemGroupedBackground))
+            .navigationTitle("手动编辑配置")
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmDiscardChanges(hasChanges: text != originalText, isBusy: isSaving, requested: $requestsDiscard)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { requestsDiscard = true }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { save() }
+                        .disabled(
+                            isSaving
+                                || text == originalText
+                                || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        )
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    KeyboardDismissButton(title: "收起键盘") { editorFocused = false }
+                }
+            }
+            .alert("无法保存配置", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("好") { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "")
+            }
+        }
+    }
+
+    private func save() {
+        isSaving = true
+        defer { isSaving = false }
+        do {
+            _ = try model.saveManualRuleSchemeConfiguration(text, for: scheme)
+            dismiss()
+            onSaved()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+/// Policy candidates are intentionally ordered: clients use the first member
+/// as the initial/default policy, while still exposing every later member for
+/// manual switching after import.
+struct OrderedPolicyCandidateSections: View {
+    @EnvironmentObject private var model: AppModel
+    @Binding var selected: [String]
+    let options: [String]
+    let scheme: RuleScheme
+    @State private var showsAddCandidate = false
+
+    private var available: [String] {
+        options.filter { !selected.contains($0) }
+    }
+
+    var body: some View {
+        Section {
+            ForEach(selected, id: \.self) { policy in
+                HStack(spacing: 12) {
+                    policyEmoji(policy)
+                    Text(policyTitle(policy))
+                    Spacer(minLength: 8)
+                    if selected.first == policy {
+                        Text("默认")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                .background(MacListReorderBridge(enabled: true))
+            }
+            .onMove { selected.move(fromOffsets: $0, toOffset: $1) }
+            .onDelete { selected.remove(atOffsets: $0) }
+
+            // One row, not a second list of every region: the group page
+            // keeps its added sites and source rules within reach. A sheet,
+            // not a Menu: in an always-editing list a row Menu never opens.
+            Button {
+                showsAddCandidate = true
+            } label: {
+                Label("添加候选策略", systemImage: "plus.circle.fill")
+            }
+            .moveDisabled(true)
+            .deleteDisabled(true)
+            .accessibilityIdentifier("policy-candidate-add")
+            .sheet(isPresented: $showsAddCandidate) {
+                NavigationStack {
+                    List {
+                        Section {
+                            ForEach(available, id: \.self) { policy in
+                                Button {
+                                    selected.append(policy)
+                                    showsAddCandidate = false
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        policyEmoji(policy)
+                                        Text(policyTitle(policy))
+                                            .foregroundStyle(.primary)
+                                        Spacer()
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(SelectionIndicatorButtonStyle())
+                            }
+                        }
+                        Section {
+                            NavigationLink {
+                                CustomNodeFilterCreator(scheme: scheme) { name in
+                                    if !selected.contains(name) { selected.append(name) }
+                                    showsAddCandidate = false
+                                }
+                            } label: {
+                                Label("自定义节点筛选", systemImage: "line.3.horizontal.decrease.circle")
+                                    .foregroundStyle(Color.accentColor)
+                            }
+                            .accessibilityIdentifier("custom-node-filter-create")
+                        }
+                    }
+                    .navigationTitle("添加候选策略")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .cancellationAction) {
+                            Button("取消") { showsAddCandidate = false }
+                        }
+                    }
+                }
+                .environmentObject(model)
+                .presentationDetents([.medium, .large])
+            }
+        } header: {
+            Text("候选策略")
+        } footer: {
+            Text("第一项是默认策略，按住右侧把手拖动排序；导入客户端后仍可手动切换。")
+        }
+    }
+
+    @ViewBuilder
+    private func policyEmoji(_ policy: String) -> some View {
+        let emoji = RulePolicyPresentation.emoji(for: policy, kind: .select, inferFromName: scheme.isBundled)
+        if !emoji.isEmpty {
+            Text(emoji).frame(width: 28)
+        }
+    }
+
+    private func policyTitle(_ policy: String) -> String {
+        switch policy.uppercased() {
+        case "DIRECT": String(localized: "直连")
+        case "REJECT": String(localized: "拒绝")
+        default: RulePolicyPresentation.nameWithoutLeadingEmoji(policy)
+        }
+    }
+}
+
+private struct SaveCustomizedSchemeSheet: View {
+    // Catalyst can lose the observable environment when a menu opens a nested sheet.
+    private let model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var requestsDiscard = false
+    let scheme: RuleScheme
+    let onSaved: () -> Void
+    private let initialName: String
+    @State private var name: String
+
+    init(model: AppModel, scheme: RuleScheme, onSaved: @escaping () -> Void) {
+        self.model = model
+        self.scheme = scheme
+        self.onSaved = onSaved
+        initialName = "\(scheme.name) · \(String(localized: "自定义"))"
+        _name = State(initialValue: initialName)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("方案名称", text: $name)
+                        .textInputAutocapitalization(.never)
+                } footer: {
+                    Text("会保存当前分组顺序、候选策略与规则，下次可直接选择。")
+                }
+            }
+            .navigationTitle("另存为新方案")
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmDiscardChanges(hasChanges: name != initialName, requested: $requestsDiscard)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { requestsDiscard = true }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") {
+                        _ = model.saveCustomizedScheme(named: name, from: scheme)
+                        dismiss()
+                        onSaved()
+                    }
+                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
+}
+
+enum RulePolicyPresentation {
+    static func emoji(for name: String, kind: RuleSchemeGroup.Kind, inferFromName: Bool = true) -> String {
+        if let leading = PolicyGroupEmoji.leading(in: name) { return leading }
+        guard inferFromName else { return "" }
+        return PolicyGroupEmoji.recognized(for: name) ?? PolicyGroupEmoji.fallback(for: kind)
+    }
+
+    private static func isEmoji(_ character: Character) -> Bool {
+        // ASCII digits, # and * are emoji-capable scalars, but are ordinary
+        // policy-name text unless part of a keycap grapheme.
+        character.unicodeScalars.contains { $0.properties.isEmojiPresentation }
+            || (character.unicodeScalars.count > 1
+                && character.unicodeScalars.contains { $0.properties.isEmoji })
+    }
+
+    static func nameWithoutLeadingEmoji(_ name: String) -> String {
+        var result = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        while let first = result.first,
+              isEmoji(first) {
+            result.removeFirst()
+            result = result.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return result.isEmpty ? name : result
+    }
+}
+
+private struct CatalogRuleRouteEditor: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var requestsDiscard = false
+    let scheme: RuleScheme
+    let flow: CustomRuleFlow
+    private let initialReferences: [String]
+    @State private var didLoadGroup = false
+    @State private var selectedReferences: [String]
+
+    init(scheme: RuleScheme, flow: CustomRuleFlow) {
+        self.scheme = scheme
+        self.flow = flow
+        let initialGroup = flow.generatedPolicyGroup ?? scheme.groups.first { $0.name == flow.policyName }
+        let initialReferences = initialGroup?.members.compactMap { member -> String? in
+            guard case .reference(let name) = member else { return nil }
+            return name
+        } ?? [flow.policyName]
+        var seenReferences = Set<String>()
+        self.initialReferences = initialReferences.filter { seenReferences.insert($0).inserted }
+        _selectedReferences = State(initialValue: self.initialReferences)
+    }
+
+    private var policyOptions: [String] {
+        scheme.routingTargetGroupNames(
+            from: model.customizableRuleGroups(for: scheme),
+            excluding: servicePolicyGroup?.name
+        )
+    }
+
+    private var servicePolicyGroup: RuleSchemeGroup? {
+        let groups = model.customizableRuleGroups(for: scheme)
+        guard let group = groups.first(where: { $0.name == flow.policyName }) else {
+            return flow.generatedPolicyGroup
+        }
+        let routingTargets = Set(scheme.routingTargetGroupNames(from: groups))
+        return routingTargets.contains(group.name) ? nil : group
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                OrderedPolicyCandidateSections(
+                    selected: $selectedReferences,
+                    options: policyOptions,
+                    scheme: scheme
+                )
+            }
+            .environment(\.editMode, .constant(.active))
+            .navigationTitle("规则流向")
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmDiscardChanges(hasChanges: selectedReferences != initialReferences, requested: $requestsDiscard)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { requestsDiscard = true }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("保存") { save() }
+                        .disabled(selectedReferences.isEmpty)
+                }
+            }
+            .onAppear {
+                guard !didLoadGroup else { return }
+                didLoadGroup = true
+                loadCurrentGroup()
+            }
+        }
+    }
+
+    private func loadCurrentGroup() {
+        guard let group = servicePolicyGroup else { return }
+        var seenReferences = Set<String>()
+        selectedReferences = group.members.compactMap { member in
+            guard case .reference(let name) = member else { return nil }
+            return name
+        }.filter { seenReferences.insert($0).inserted }
+    }
+
+    private func save() {
+        var updated = flow
+        let members = selectedReferences.map(RuleSchemeGroupMember.reference)
+
+        if let group = servicePolicyGroup {
+            let edited = RuleSchemeGroup(
+                name: group.name,
+                kind: .select,
+                members: members,
+                testURLString: group.testURLString,
+                interval: group.interval,
+                tolerance: group.tolerance,
+                algorithm: group.algorithm,
+                sourceType: group.sourceType,
+                sourceFormat: group.sourceFormat,
+                parameters: group.parameters
+            )
+            updated.policyName = group.name
+            if flow.generatedPolicyGroup != nil {
+                updated.generatedPolicyGroup = edited
+            } else {
+                model.updateRuleGroup(edited, for: scheme)
+                updated.generatedPolicyGroup = nil
+            }
+        } else {
+            let groupName = flow.generatedPolicyGroup?.name ?? flow.name
+            updated.policyName = groupName
+            updated.generatedPolicyGroup = RuleSchemeGroup(
+                name: groupName,
+                kind: .select,
+                members: members
+            )
+        }
+        model.upsertCustomRuleFlow(updated)
+        dismiss()
+    }
+}
+
+private struct LocalRuleSetEditor: View {
+    private enum Field: Hashable {
+        case name
+        case rules
+    }
+
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var requestsDiscard = false
+    @State private var didFocusName = false
+    let existingRuleSet: LocalRuleSet?
+    @State private var name: String
+    @State private var rulesText: String
+    @State private var isSaving = false
+    @State private var saveTask: Task<Void, Never>?
+    @State private var errorMessage: String?
+    @FocusState private var focusedField: Field?
+
+    init(ruleSet: LocalRuleSet?) {
+        existingRuleSet = ruleSet
+        _name = State(initialValue: ruleSet?.name ?? "")
+        _rulesText = State(initialValue: ruleSet?.ruleInputText ?? "")
+    }
+
+    private var ruleContentSummary: String {
+        draft.remoteRuleURL == nil ? String(localized: "规则文本") : String(localized: "远程规则集")
+    }
+
+    private var draft: LocalRuleSet {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard var ruleSet = existingRuleSet else {
+            return LocalRuleSet(
+                name: trimmedName,
+                rulesText: rulesText
+            )
+        }
+
+        ruleSet.name = trimmedName
+        if rulesText != ruleSet.ruleInputText {
+            ruleSet.setRuleInput(rulesText)
+        }
+        return ruleSet
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("规则集") {
+                    TextField("名称，例如 🎬 奈飞", text: $name)
+                        .focused($focusedField, equals: .name)
+                        .submitLabel(.next)
+                        .onSubmit { focusedField = .rules }
+                }
+
+                Section {
+                    ZStack(alignment: .topLeading) {
+                        if rulesText.isEmpty {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("规则集 URL，例如：")
+                                Text(verbatim: "https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Clash/UnBan.list")
+                                Text("或逐行输入：")
+                                Text(verbatim: "DOMAIN,apple.comscoreresearch.com")
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.72)
+                                Text(verbatim: "IP-CIDR,17.0.0.0/8,no-resolve")
+                                    .lineLimit(1)
+                                    .minimumScaleFactor(0.72)
+                            }
+                            .font(.system(.footnote, design: .monospaced))
+                            .lineSpacing(1)
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 8)
+                            .allowsHitTesting(false)
+                        }
+
+                        TextEditor(text: $rulesText)
+                            .accessibilityIdentifier("local-rules-text")
+                            .font(.system(.footnote, design: .monospaced))
+                            .scrollContentBackground(.hidden)
+                            .frame(minHeight: 230)
+                            .focused($focusedField, equals: .rules)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                } header: {
+                    HStack {
+                        Text("规则内容")
+                        Spacer()
+                        Text(ruleContentSummary)
+                    }
+                } footer: {
+                    Text("支持 HTTPS 规则集链接，或逐行输入条件规则。保存后点击加号加入当前方案。")
+                }
+                LocalRuleCompatibilityView(text: rulesText)
+            }
+            .navigationTitle(existingRuleSet == nil
+                ? String(localized: "新建规则集")
+                : String(localized: "编辑规则集"))
+            .navigationBarTitleDisplayMode(.inline)
+            .confirmDiscardChanges(hasChanges: name != (existingRuleSet?.name ?? "") || rulesText != (existingRuleSet?.ruleInputText ?? ""), isBusy: isSaving, requested: $requestsDiscard) { saveTask?.cancel() }
+            .onDisappear { saveTask?.cancel() }
+            .scrollDismissesKeyboard(.interactively)
+            .accessibilityIdentifier("custom-rule-flow-editor")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消") { requestsDiscard = true }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button(isSaving ? "正在保存…" : "保存") { save() }
+                        .disabled(
+                            name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || rulesText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || isSaving
+                        )
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    KeyboardDismissButton(title: "收起键盘") { focusedField = nil }
+                }
+            }
+            .onAppear {
+                if existingRuleSet == nil, !didFocusName {
+                    didFocusName = true
+                    focusedField = .name
+                }
+            }
+            .alert("无法保存规则集", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("好") { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "")
+            }
+        }
+    }
+
+    private func save() {
+        focusedField = nil
+        let ruleSet = draft
+        isSaving = true
+        saveTask = Task { @MainActor in
+            do {
+                try await model.saveLocalRuleSet(ruleSet)
+                dismiss()
+            } catch {
+                isSaving = false
+                guard !Task.isCancelled, !(error is CancellationError) else { return }
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// Add mouse recognition to the entire Catalyst cell while keeping List's native
+/// interactive movement, animation, accessibility actions and onMove callback.
+private struct MacListReorderBridge: UIViewRepresentable {
+    let enabled: Bool
+
+    func makeUIView(context: Context) -> AttachmentView {
+        let view = AttachmentView()
+        view.isUserInteractionEnabled = false
+        view.attach = { [weak coordinator = context.coordinator, weak view] in
+            guard let view else { return }
+            coordinator?.attach(from: view)
+        }
+        return view
+    }
+    func updateUIView(_ view: AttachmentView, context: Context) {
+        context.coordinator.enabled = enabled
+        context.coordinator.attach(from: view)
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    static func dismantleUIView(_ view: AttachmentView, coordinator: Coordinator) {
+        view.attach = nil
+        coordinator.detach()
+    }
+    final class AttachmentView: UIView {
+        var attach: (() -> Void)?
+        override func didMoveToWindow() { super.didMoveToWindow(); attach?() }
+        override func didMoveToSuperview() { super.didMoveToSuperview(); attach?() }
+    }
+    final class ReorderPanGestureRecognizer: UIPanGestureRecognizer {
+        // Once a mouse drag starts, the cell's button/reorder recognizers
+        // must not steal it. A click still fails the normal pan threshold.
+        override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
+    }
+    @MainActor
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var enabled = true
+        private weak var cell: UICollectionViewCell?
+        private weak var collection: UICollectionView?
+        private var pan: UIPanGestureRecognizer?
+        private var moving = false
+        private var grabOffset: CGPoint = .zero
+
+        func attach(from view: UIView) {
+            #if targetEnvironment(macCatalyst)
+            var ancestor = view.superview
+            while let next = ancestor, !(next is UICollectionViewCell) { ancestor = next.superview }
+            guard let resolvedCell = ancestor as? UICollectionViewCell else { return }
+            ancestor = resolvedCell.superview
+            while let next = ancestor, !(next is UICollectionView) { ancestor = next.superview }
+            guard let resolvedCollection = ancestor as? UICollectionView,
+                  cell !== resolvedCell else { return }
+            detach()
+            cell = resolvedCell
+            collection = resolvedCollection
+            // Catalyst's external drag session otherwise cancels interactive
+            // reordering midway, including drags on the native accessory.
+            resolvedCollection.dragInteractionEnabled = false
+            let recognizer = ReorderPanGestureRecognizer(target: self, action: #selector(drag(_:)))
+            recognizer.delegate = self
+            recognizer.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+            recognizer.cancelsTouchesInView = true
+            resolvedCollection.addGestureRecognizer(recognizer)
+            resolvedCollection.panGestureRecognizer.require(toFail: recognizer)
+            pan = recognizer
+            #endif
+        }
+        func detach() {
+            let wasMoving = moving
+            moving = false
+            let recognizer = pan
+            pan = nil
+            if wasMoving { collection?.cancelInteractiveMovement() }
+            if let recognizer { recognizer.view?.removeGestureRecognizer(recognizer) }
+            cell = nil
+            collection = nil
+        }
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+            guard enabled, let cell, let collection else { return false }
+            let pointer = touch.location(in: collection)
+            guard let index = collection.indexPath(for: cell),
+                  collection.indexPathForItem(at: pointer) == index else { return false }
+            grabOffset = CGPoint(x: cell.center.x - pointer.x, y: cell.center.y - pointer.y)
+            return true
+        }
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard enabled, let cell, let collection,
+                  let index = collection.indexPath(for: cell),
+                  collection.dataSource?.collectionView?(collection, canMoveItemAt: index) == true else { return false }
+            return true
+        }
+        func gestureRecognizer(
+            _ gestureRecognizer: UIGestureRecognizer,
+            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+        ) -> Bool {
+            // SwiftUI buttons track presses before a pan crosses its threshold.
+            // Let the pan start there too; movement cancels the button's tap.
+            otherGestureRecognizer !== collection?.panGestureRecognizer
+        }
+        private func updateTarget(_ recognizer: UIPanGestureRecognizer) {
+            guard moving, let collection else { return }
+            let pointer = recognizer.location(in: collection)
+            collection.updateInteractiveMovementTargetPosition(
+                CGPoint(x: pointer.x + grabOffset.x, y: pointer.y + grabOffset.y)
+            )
+        }
+        @objc private func drag(_ recognizer: UIPanGestureRecognizer) {
+            guard recognizer === pan, let collection else { return }
+            switch recognizer.state {
+            case .began:
+                guard let cell, let index = collection.indexPath(for: cell) else { return }
+                moving = collection.beginInteractiveMovementForItem(at: index)
+                updateTarget(recognizer)
+            case .changed:
+                updateTarget(recognizer)
+            case .ended:
+                // Fast mouse drags can coalesce all motion into began/ended.
+                updateTarget(recognizer)
+                let wasMoving = moving
+                moving = false
+                if wasMoving { collection.endInteractiveMovement() }
+            case .cancelled, .failed:
+                let wasMoving = moving
+                moving = false
+                if wasMoving { collection.cancelInteractiveMovement() }
+            default: break
+            }
+        }
+    }
+}
